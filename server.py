@@ -290,17 +290,24 @@ def index():
 def get_buildings():
     try:
         cfg  = load_config()
-        # Debug: try different request formats
+        # Debug: try specific body formats
         import requests as _req
         _tok = hbo_token(cfg)
         _url = f"{cfg['hbo']['base_url']}/building/search"
+        _h = {"Authorization": f"Bearer {_tok}", "Content-Type": "application/json"}
         _results = {}
-        # Test 1: POST with no body
-        _r1 = _req.post(_url, headers={"Authorization": f"Bearer {_tok}"}, timeout=20)
-        _results["post_nobody"] = {"status": _r1.status_code, "text": _r1.text[:300]}
-        # Test 2: GET
-        _r2 = _req.get(_url, headers={"Authorization": f"Bearer {_tok}", "Content-Type": "application/json"}, timeout=20)
-        _results["get"] = {"status": _r2.status_code, "text": _r2.text[:300]}
+        for label, body in [
+            ("page1", {"page": 1, "itemsPerPage": 20}),
+            ("filters", {"filters": {}, "page": 1}),
+            ("empty_list", []),
+            ("buildings_list", "/buildings"),
+        ]:
+            if label == "buildings_list":
+                # Try /buildings endpoint instead
+                _r = _req.get(f"{cfg['hbo']['base_url']}/buildings", headers=_h, timeout=20)
+            else:
+                _r = _req.post(_url, headers=_h, json=body, timeout=20)
+            _results[label] = {"status": _r.status_code, "text": _r.text[:200]}
         return jsonify({"ok": True, "buildings": [], "_debug": _results})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "buildings": []}), 200
