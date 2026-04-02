@@ -508,7 +508,7 @@ async function loadBuildings(){
     const r=await fetch(API+'/api/buildings');
     if(r.ok){(await r.json()).buildings?.forEach(b=>{const o=document.createElement('option');o.value=b.id;o.textContent=b.name;sel.appendChild(o);});}
   }catch(_){}
-  const d=document.createElement('option');d.value='demo';d.textContent='34-36 Bd de l'Hôpital (démo)';sel.appendChild(d);
+  const d=document.createElement('option');d.value='demo';d.textContent="34-36 Bd de l'H\u00f4pital (d\u00e9mo)";sel.appendChild(d);
   sel.value='demo';
 }
 function ss(m,c=''){const e=document.getElementById('st');e.textContent=m;e.className=c;}
