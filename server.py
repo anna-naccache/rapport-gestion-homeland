@@ -103,26 +103,29 @@ def list_items(data):
 # RINGOVER
 # ─────────────────────────────────────────────
 
-def ringover_calls(cfg, date_start, date_end):
+def ringover_calls(cfg, date_start, date_end, building_name="", building_tags=None):
+    """Récupère tous les appels (entrants et sortants) sur la période."""
     base, api_key = cfg["ringover"]["base_url"], cfg["ringover"]["api_key"]
-    calls, offset = [], 0
-    while True:
-        try:
-            r = requests.get(f"{base}/calls",
-                headers={"Authorization": api_key},
-                params={"limit_count": 100, "limit_offset": offset,
-                        "period_start": f"{date_start}T00:00:00",
-                        "period_end":   f"{date_end}T23:59:59",
-                        "call_type":    "inbound"},
-                timeout=20)
-            r.raise_for_status()
-            batch = r.json().get("callList", r.json().get("calls", []))
-            if not batch: break
-            calls.extend(batch)
-            if len(batch) < 100: break
-            offset += 100
-        except Exception as e:
-            print(f"  ⚠ Ringover: {e}"); break
+    calls = []
+    for call_type in ["inbound", "outbound"]:
+        offset = 0
+        while True:
+            try:
+                r = requests.get(f"{base}/calls",
+                    headers={"Authorization": api_key},
+                    params={"limit_count": 100, "limit_offset": offset,
+                            "period_start": f"{date_start}T00:00:00",
+                            "period_end":   f"{date_end}T23:59:59",
+                            "call_type":    call_type},
+                    timeout=20)
+                r.raise_for_status()
+                batch = r.json().get("callList", r.json().get("calls", []))
+                if not batch: break
+                calls.extend(batch)
+                if len(batch) < 100: break
+                offset += 100
+            except Exception as e:
+                print(f"  ⚠ Ringover ({call_type}): {e}"); break
     return calls
 
 # ─────────────────────────────────────────────
@@ -166,6 +169,14 @@ CATEGORY_KEYWORDS = {
 }
 CLOSED_WORDS = {"closed","terminé","termine","done","completed","clos","archivé","archive","resolved"}
 
+# Mots-clés pour identifier le service depuis les tags/labels Ringover
+SERVICE_KEYWORDS = {
+    "gestion":       ["gestion", "gestionnaire", "copro", "copropriété"],
+    "comptabilité":  ["compta", "comptabilité", "comptable", "finance"],
+    "juridique":     ["juridique", "juriste", "contentieux", "avocat"],
+    "support":       ["support", "technique", "urgence", "dépannage"],
+}
+
 def categorize(p):
     txt = " ".join([
         str(p.get("title") or ""), str(p.get("name") or ""),
@@ -206,42 +217,81 @@ def to_incidents_list(raw_items):
         })
     return result
 
+def get_call_service(call):
+    """Détermine le service d'un appel depuis ses tags/labels."""
+    tags = []
+    # Ringover peut retourner des tags dans différents champs
+    for field in ("tags", "labels", "team", "ivr_option", "via_number_label"):
+        val = call.get(field)
+        if val:
+            if isinstance(val, list):
+                tags.extend([str(t).lower() for t in val])
+            else:
+                tags.append(str(val).lower())
+    # Aussi regarder le numéro appelé / destination
+    for field in ("to_number", "called_number", "to"):
+        val = call.get(field)
+        if val: tags.append(str(val).lower())
+
+    tags_str = " ".join(tags)
+    for service, keywords in SERVICE_KEYWORDS.items():
+        if any(kw in tags_str for kw in keywords):
+            return service
+    return "autre"
+
 def process_calls_v3(calls):
     total  = len(calls)
-    in_cnt = sum(1 for c in calls if str(c.get("type") or c.get("direction") or "in").lower() in ("in","inbound","incoming"))
+    in_cnt  = sum(1 for c in calls if str(c.get("type") or c.get("direction") or "in").lower() in ("in","inbound","incoming"))
     out_cnt = total - in_cnt
     dur_sec = [int(c.get("duration") or c.get("duration_seconds") or 0) for c in calls]
-    avg_dur = (sum(dur_sec) / len(dur_sec)) if dur_sec else 0
+    total_sec = sum(dur_sec)
+    avg_dur   = (total_sec / len(dur_sec)) if dur_sec else 0
+
     by_month = defaultdict(int)
+    by_service = defaultdict(lambda: {"count": 0, "duration_seconds": 0})
     for c in calls:
         ds = c.get("startedAt") or c.get("started_at") or c.get("date") or ""
         if ds: by_month[ds[:7]] += 1
+        svc = get_call_service(c)
+        by_service[svc]["count"] += 1
+        by_service[svc]["duration_seconds"] += int(c.get("duration") or c.get("duration_seconds") or 0)
+
     return {
-        "total":              total,
-        "inbound":            in_cnt,
-        "outbound":           out_cnt,
+        "total":                total,
+        "inbound":              in_cnt,
+        "outbound":             out_cnt,
         "avg_duration_seconds": round(avg_dur),
-        "by_month":           dict(sorted(by_month.items())),
+        "total_duration_hours": round(total_sec / 3600, 1),
+        "by_month":             dict(sorted(by_month.items())),
+        "by_service":           {k: dict(v) for k, v in by_service.items()},
     }
 
 def process_emails_v3(convs):
     by_month = defaultdict(int)
-    resp_times = []
+    sent_count = 0
+    received_count = 0
     for c in convs:
         ts = c.get("created_at") or c.get("last_message_at")
         if ts:
             by_month[datetime.fromtimestamp(ts).strftime("%Y-%m")] += 1
         elif c.get("createdAt"):
             by_month[c["createdAt"][:7]] += 1
-        # Délai de réponse approximatif
-        rt = c.get("response_time")
-        if rt: resp_times.append(rt)
-    avg_h = (sum(resp_times) / len(resp_times) / 3600) if resp_times else None
+        # Direction de la conversation (inbound = reçu, outbound = envoyé)
+        direction = str(c.get("status") or "").lower()
+        if direction in ("assigned", "unassigned", "open", ""):
+            # Conversation initiée par le client = reçu
+            received_count += 1
+        else:
+            sent_count += 1
+    # Si on ne peut pas distinguer, total = received
+    if sent_count == 0 and received_count == 0:
+        received_count = len(convs)
+
     return {
-        "total":               len(convs),
-        "avg_response_hours":  round(avg_h, 1) if avg_h else None,
-        "response_rate":       None,
-        "by_month":            dict(sorted(by_month.items())),
+        "total":          len(convs),
+        "sent":           sent_count,
+        "received":       received_count,
+        "by_month":       dict(sorted(by_month.items())),
     }
 
 def process_assemblies_v3(raw):
@@ -256,6 +306,22 @@ def process_assemblies_v3(raw):
             "date":   dt[:10] if dt else "",
             "status": "Tenu" if is_closed(a) else "Planifié",
         })
+    return sorted(result, key=lambda x: x["date"], reverse=True)
+
+def process_visits_v3(assembs_raw, visits_raw=None):
+    """Combine assemblées et visites en une seule liste."""
+    result = process_assemblies_v3(assembs_raw)
+    if visits_raw:
+        for v in visits_raw:
+            dt = v.get("date") or v.get("scheduledAt") or v.get("visitedAt") or ""
+            tp = v.get("type", {})
+            t  = (tp.get("name") or tp.get("label") if isinstance(tp, dict) else str(tp)) or "Visite"
+            result.append({
+                "name":   v.get("name") or v.get("title") or f"Visite {t}",
+                "type":   t,
+                "date":   dt[:10] if dt else "",
+                "status": "Effectuée" if is_closed(v) else "Planifiée",
+            })
     return sorted(result, key=lambda x: x["date"], reverse=True)
 
 def satisfaction_to_v3(sat):
@@ -289,26 +355,56 @@ def index():
 @app.route("/api/buildings")
 def get_buildings():
     try:
-        cfg  = load_config()
-        # Debug: try specific body formats
-        import requests as _req
-        _tok = hbo_token(cfg)
-        _url = f"{cfg['hbo']['base_url']}/building/search"
-        _h = {"Authorization": f"Bearer {_tok}", "Content-Type": "application/json"}
-        _results = {}
-        for label, body in [
-            ("page1", {"page": 1, "itemsPerPage": 20}),
-            ("filters", {"filters": {}, "page": 1}),
-            ("empty_list", []),
-            ("buildings_list", "/buildings"),
-        ]:
-            if label == "buildings_list":
-                # Try /buildings endpoint instead
-                _r = _req.get(f"{cfg['hbo']['base_url']}/buildings", headers=_h, timeout=20)
-            else:
-                _r = _req.post(_url, headers=_h, json=body, timeout=20)
-            _results[label] = {"status": _r.status_code, "text": _r.text[:200]}
-        return jsonify({"ok": True, "buildings": [], "_debug": _results})
+        cfg = load_config()
+        tok = hbo_token(cfg)
+        headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+        base_url = cfg['hbo']['base_url']
+
+        buildings = []
+        # Essai 1 : POST /building/search avec pagination
+        try:
+            r = requests.post(f"{base_url}/building/search",
+                headers=headers,
+                json={"page": 1, "itemsPerPage": 50},
+                timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+                buildings = list_items(data)
+        except Exception as e:
+            print(f"  ⚠ /building/search: {e}")
+
+        # Essai 2 : GET /buildings
+        if not buildings:
+            try:
+                r = requests.get(f"{base_url}/buildings", headers=headers, timeout=20)
+                if r.status_code == 200:
+                    data = r.json()
+                    buildings = list_items(data)
+            except Exception as e:
+                print(f"  ⚠ /buildings: {e}")
+
+        # Essai 3 : GET /coproprietes ou /syndic/buildings
+        if not buildings:
+            for endpoint in ["/coproprietes", "/syndic/buildings", "/building/list"]:
+                try:
+                    r = requests.get(f"{base_url}{endpoint}", headers=headers, timeout=20)
+                    if r.status_code == 200:
+                        buildings = list_items(r.json())
+                        if buildings: break
+                except Exception:
+                    pass
+
+        result = []
+        for b in buildings:
+            bid = b.get("id") or b.get("buildingId")
+            if not bid: continue
+            result.append({
+                "id":      bid,
+                "name":    b.get("name") or b.get("address") or f"#{bid}",
+                "address": b.get("address") or "",
+                "city":    b.get("city") or "",
+            })
+        return jsonify({"ok": True, "buildings": result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "buildings": []}), 200
 
@@ -325,18 +421,40 @@ def get_building_data(bid):
         date_end   = de_param or now.strftime("%Y-%m-%d")
         date_start = ds_param or (now - timedelta(days=mois * 30)).strftime("%Y-%m-%d")
 
-        # HBO
+        # HBO — infos bâtiment
         b       = hbo(cfg, f"/building/{bid}") or {}
         projs   = list_items(hbo(cfg, f"/projects/{bid}", {"order": "desc"}))
         incs    = list_items(hbo(cfg, "/incidents", {"building_id": bid}))
         assembs = list_items(hbo(cfg, "/assemblies", {"building_id": bid}))
+        visits  = list_items(hbo(cfg, "/visits", {"building_id": bid}))
+
+        # Extraire gestionnaire et comptable
+        manager_field = b.get("manager") or b.get("gestionnaire") or {}
+        accountant_field = b.get("accountant") or b.get("comptable") or {}
+        if isinstance(manager_field, dict):
+            manager_name = (manager_field.get("firstName") or manager_field.get("first_name") or "") + " " + (manager_field.get("lastName") or manager_field.get("last_name") or "")
+            manager_name = manager_name.strip() or manager_field.get("name") or manager_field.get("email") or ""
+        else:
+            manager_name = str(manager_field)
+        if isinstance(accountant_field, dict):
+            accountant_name = (accountant_field.get("firstName") or accountant_field.get("first_name") or "") + " " + (accountant_field.get("lastName") or accountant_field.get("last_name") or "")
+            accountant_name = accountant_name.strip() or accountant_field.get("name") or accountant_field.get("email") or ""
+        else:
+            accountant_name = str(accountant_field)
+
+        # Date de création / début de gestion
+        created_at = b.get("createdAt") or b.get("created_at") or b.get("managedSince") or b.get("dateCreation") or ""
+        if created_at:
+            created_at = created_at[:10]
 
         # Communications
-        all_calls  = ringover_calls(cfg, date_start, date_end)
+        b_name = b.get("name", "")
+        building_tags = [b_name[:6].lower()] if b_name else []
+
+        all_calls  = ringover_calls(cfg, date_start, date_end, building_name=b_name, building_tags=building_tags)
         all_emails = front_convs(cfg, date_start, date_end)
 
         # Filtrer par bâtiment si possible
-        b_name = b.get("name", "")
         bcalls  = [c for c in all_calls  if str(c.get("building_id","")) == str(bid)] or all_calls
         bemails = [e for e in all_emails if str(e.get("building_id","")) == str(bid)
                    or b_name[:6].lower() in str(e.get("subject","")).lower()] or all_emails
@@ -347,19 +465,25 @@ def get_building_data(bid):
             "notes": b.get("satisfactionNotes") or [],
         }
 
+        # Lots count
+        lots_count = b.get("lots") or b.get("lotsCount") or b.get("lotsPrincipaux") or 0
+
         result = {
             "building": {
-                "name":    b.get("name") or b.get("address") or f"#{bid}",
-                "address": b.get("address") or "",
-                "city":    b.get("city") or "",
-                "lots":    b.get("lots") or b.get("lotsCount") or 0,
+                "name":       b.get("name") or b.get("address") or f"#{bid}",
+                "address":    b.get("address") or "",
+                "city":       b.get("city") or "",
+                "lots":       lots_count,
+                "manager":    manager_name,
+                "accountant": accountant_name,
+                "created_at": created_at,
             },
             "csat":       satisfaction_to_v3(sat_raw),
             "projects":   to_projects_list(projs),
             "incidents":  to_incidents_list(incs),
             "calls":      process_calls_v3(bcalls),
             "emails":     process_emails_v3(bemails),
-            "assemblies": process_assemblies_v3(assembs),
+            "visits":     process_visits_v3(assembs, visits),
             "period": {
                 "start": date_start,
                 "end":   date_end,
@@ -376,9 +500,12 @@ def get_demo():
     """Données de démo réalistes."""
     return jsonify({
         "building": {
-            "name":    "34, 36 et 36 bis Boulevard de l'Hôpital",
-            "address": "75005 Paris",
-            "lots":    42,
+            "name":       "34, 36 et 36 bis Boulevard de l'Hôpital",
+            "address":    "75005 Paris",
+            "lots":       42,
+            "manager":    "Sophie Martin",
+            "accountant": "Pierre Dubois",
+            "created_at": "2019-03-15",
         },
         "csat": {
             "score": 4.1,
@@ -405,7 +532,7 @@ def get_demo():
             {"name": "Remplacement visiophone",               "category": "GESTION",    "status": "Clôturé", "date": "2024-09-14"},
         ],
         "emails": {
-            "total": 387, "avg_response_hours": 3.2, "response_rate": 0.96,
+            "total": 387, "sent": 205, "received": 182,
             "by_month": {
                 "2024-04":28,"2024-05":31,"2024-06":29,"2024-07":22,"2024-08":18,
                 "2024-09":33,"2024-10":35,"2024-11":38,"2024-12":30,
@@ -413,11 +540,22 @@ def get_demo():
             }
         },
         "calls": {
-            "total": 214, "inbound": 168, "outbound": 46, "avg_duration_seconds": 187
+            "total": 214, "inbound": 168, "outbound": 46,
+            "avg_duration_seconds": 187,
+            "total_duration_hours": 11.1,
+            "by_service": {
+                "gestion":      {"count": 89, "duration_seconds": 18200},
+                "comptabilité": {"count": 52, "duration_seconds": 9400},
+                "support":      {"count": 43, "duration_seconds": 7800},
+                "juridique":    {"count": 18, "duration_seconds": 5600},
+                "autre":        {"count": 12, "duration_seconds": 1600},
+            }
         },
-        "assemblies": [
-            {"name": "Assemblée Générale Ordinaire 2024",           "type": "AGO", "date": "2024-06-12", "status": "Tenu"},
-            {"name": "Assemblée Générale Extraordinaire — Ravalement","type": "AGE","date": "2024-11-20", "status": "Tenu"},
+        "visits": [
+            {"name": "Assemblée Générale Ordinaire 2024",           "type": "AGO",    "date": "2024-06-12", "status": "Tenu"},
+            {"name": "Assemblée Générale Extraordinaire — Ravalement","type": "AGE",  "date": "2024-11-20", "status": "Tenu"},
+            {"name": "Visite technique — état des façades",          "type": "Visite","date": "2024-09-05", "status": "Effectuée"},
+            {"name": "Visite conseil syndical",                      "type": "Visite","date": "2025-01-14", "status": "Effectuée"},
         ]
     })
 

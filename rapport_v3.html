@@ -112,9 +112,13 @@ body{
   display:flex;justify-content:space-between;align-items:flex-end;
 }
 .ci .ci-l{font-size:9px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.48);margin-bottom:5px;}
+.ci .ci-l+.ci-l{margin-top:10px;}
 .ci .ci-v{font-family:'Lora',serif;font-size:20px;font-weight:700;color:#fff;}
+.ci .ci-vs{font-family:'Poppins',sans-serif;font-size:14px;font-weight:500;color:#fff;opacity:.9;margin-bottom:2px;}
+.ci .ci-sub{font-size:10.5px;color:rgba(255,255,255,.62);margin-top:4px;font-style:italic;}
 .ci.rt{text-align:right;}
 .ci.rt .ci-v{font-family:'Poppins',sans-serif;font-size:13px;font-weight:400;opacity:.85;}
+.ci.rt .ci-vs{font-size:13px;}
 
 /* ── INTERIOR PAGES ── */
 .page-int{min-height:500px;display:flex;flex-direction:column;}
@@ -301,8 +305,17 @@ body{
     <div class="ci">
       <div class="ci-l">Copropriété</div>
       <div class="ci-v" id="cov-sdc">—</div>
+      <div class="ci-sub" id="cov-depuis" style="display:none;"></div>
+    </div>
+    <div class="ci">
+      <div class="ci-l">Gestionnaire</div>
+      <div class="ci-vs" id="cov-gest">—</div>
+      <div class="ci-l">Comptable</div>
+      <div class="ci-vs" id="cov-compt">—</div>
     </div>
     <div class="ci rt">
+      <div class="ci-l">Lots principaux</div>
+      <div class="ci-vs" id="cov-lots">—</div>
       <div class="ci-l">Période de référence</div>
       <div class="ci-v" id="cov-per">—</div>
     </div>
@@ -327,7 +340,7 @@ body{
       <div class="sh"><div class="sh-ico">⭐</div><div class="sh-ttl">Satisfaction client (CSAT)</div></div>
       <div class="csat-wrap">
         <div class="csat-ring"><canvas id="chart-csat"></canvas>
-          <div class="csat-ctr"><div class="csat-n" id="csat-v">—</div><div class="csat-d">/5</div></div>
+          <div class="csat-ctr"><div class="csat-n" id="csat-v">—</div><div class="csat-d">satisfaction</div></div>
         </div>
         <div class="csat-r" id="csat-d"></div>
       </div>
@@ -365,7 +378,7 @@ body{
     </div>
     <div class="divider"></div>
     <div class="sec" id="s-ag">
-      <div class="sh"><div class="sh-ico">🏛</div><div class="sh-ttl">Assemblées générales</div></div>
+      <div class="sh"><div class="sh-ico">🏛</div><div class="sh-ttl">Visites &amp; Assemblées</div></div>
       <div id="ag-w"></div>
     </div>
   </div>
@@ -430,7 +443,7 @@ const MODS=[
   {id:'proj',  nm:'Projets',             ic:'📁',pg:'pg-syn',sc:'s-proj'},
   {id:'em',   nm:'Emails',              ic:'📧',pg:'pg-int',sc:'s-em'  },
   {id:'ap',   nm:'Appels',              ic:'📞',pg:'pg-int',sc:'s-ap'  },
-  {id:'ag',   nm:'Assemblées',          ic:'🏛',pg:'pg-int',sc:'s-ag'  },
+  {id:'ag',   nm:'Visites & Assemblées', ic:'🏛',pg:'pg-int',sc:'s-ag'  },
   {id:'si',   nm:'Sinistres',           ic:'⚠️',pg:'pg-sin',sc:'s-si'  },
   {id:'tr',   nm:'Travaux',             ic:'🔨',pg:'pg-sin',sc:'s-tr'  },
   {id:'ge',   nm:'Gestion courante',    ic:'📝',pg:'pg-ges',sc:'s-ge'  },
@@ -440,7 +453,7 @@ let CC=null,EC=null;
 
 /* ---- DEMO DATA (realistic) ---- */
 const DEMO={
-  building:{name:"34, 36 et 36 bis Boulevard de l'Hôpital",address:"75005 Paris",lots:42,syndic:"Homeland"},
+  building:{name:"34, 36 et 36 bis Boulevard de l'Hôpital",address:"75005 Paris",lots:42,manager:"Sophie Martin",accountant:"Pierre Dubois",created_at:"2019-03-15"},
   csat:{score:4.1,distribution:{5:18,4:14,3:6,2:3,1:1}},
   projects:[
     {name:"Ravalement de façade",category:"TRAVAUX",status:"En cours",start_date:"2024-03-01"},
@@ -450,11 +463,14 @@ const DEMO={
     {name:"Installation boîtes aux lettres normalisées",category:"GESTION",status:"Terminé",start_date:"2024-01-10"},
     {name:"Litige étanchéité terrasse lot 12",category:"LITIGES",status:"En cours",start_date:"2024-04-01"},
   ],
-  emails:{total:387,avg_response_hours:3.2,response_rate:0.96,by_month:{"2024-04":28,"2024-05":31,"2024-06":29,"2024-07":22,"2024-08":18,"2024-09":33,"2024-10":35,"2024-11":38,"2024-12":30,"2025-01":32,"2025-02":34,"2025-03":37}},
-  calls:{total:214,inbound:168,outbound:46,avg_duration_seconds:187},
-  assemblies:[
+  emails:{total:387,sent:205,received:182,by_month:{"2024-04":28,"2024-05":31,"2024-06":29,"2024-07":22,"2024-08":18,"2024-09":33,"2024-10":35,"2024-11":38,"2024-12":30,"2025-01":32,"2025-02":34,"2025-03":37}},
+  calls:{total:214,inbound:168,outbound:46,avg_duration_seconds:187,total_duration_hours:11.1,
+    by_service:{gestion:{count:89,duration_seconds:18200},comptabilité:{count:52,duration_seconds:9400},support:{count:43,duration_seconds:7800},juridique:{count:18,duration_seconds:5600},autre:{count:12,duration_seconds:1600}}},
+  visits:[
     {name:"Assemblée Générale Ordinaire 2024",type:"AGO",date:"2024-06-12",status:"Tenu"},
     {name:"Assemblée Générale Extraordinaire — Ravalement",type:"AGE",date:"2024-11-20",status:"Tenu"},
+    {name:"Visite technique — état des façades",type:"Visite",date:"2024-09-05",status:"Effectuée"},
+    {name:"Visite conseil syndical",type:"Visite",date:"2025-01-14",status:"Effectuée"},
   ],
   incidents:[
     {name:"Dégât des eaux appartement 3B",category:"SINISTRES",status:"Clôturé",date:"2024-02-14"},
@@ -542,9 +558,22 @@ function mkT(hs,rows){
 
 /* ── main render ── */
 function render(data,ds,de){
-  const name=data.building?.name||'—',per=fmM(ds)+' – '+fmM(de);
+  const b=data.building||{},name=b.name||'—',per=fmM(ds)+' – '+fmM(de);
   document.getElementById('cov-sdc').textContent=name;
   document.getElementById('cov-per').textContent=per;
+  // Gestionnaire & comptable
+  document.getElementById('cov-gest').textContent=b.manager||'—';
+  document.getElementById('cov-compt').textContent=b.accountant||'—';
+  // Lots
+  document.getElementById('cov-lots').textContent=b.lots?b.lots+' lots':'—';
+  // Depuis
+  if(b.created_at){
+    const d=new Date(b.created_at);
+    const MN=['janvier','février','mars','avril','mai','juin','juillet','août','septembre','octobre','novembre','décembre'];
+    const depEl=document.getElementById('cov-depuis');
+    depEl.textContent='Vous nous faites confiance depuis '+MN[d.getMonth()]+' '+d.getFullYear();
+    depEl.style.display='';
+  }
   document.getElementById('cov-ov').style.display='';
   [2,3,4,5].forEach(i=>{
     document.getElementById('h'+i+'s').textContent=name;
@@ -552,14 +581,15 @@ function render(data,ds,de){
     document.getElementById('f'+i+'s').textContent=name;
     document.getElementById('f'+i+'p').textContent=per;
   });
-  rCSAT(data);rProj(data);rEmails(data);rAppels(data);rAG(data);rSin(data);rTr(data);rGes(data);
+  rCSAT(data);rProj(data);rEmails(data);rAppels(data);rVisits(data);rSin(data);rTr(data);rGes(data);
   MODS.forEach(m=>{const s=document.getElementById(m.sc);if(s)s.style.display=A[m.id]?'':'none';});
   updPg();
 }
 
 function rCSAT(data){
   const c=data.csat||{},sc=c.score?parseFloat(c.score):null,pct=sc?(sc/5)*100:0;
-  document.getElementById('csat-v').textContent=sc?sc.toFixed(1):'—';
+  // Afficher % de satisfaction au lieu de /5
+  document.getElementById('csat-v').textContent=sc?Math.round(pct)+'%':'—';
   if(CC){CC.destroy();CC=null;}
   CC=new Chart(document.getElementById('chart-csat'),{
     type:'doughnut',data:{datasets:[{data:[pct,100-pct],backgroundColor:['#61aa7e','#eef7f2'],borderWidth:0}]},
@@ -575,33 +605,43 @@ function rCSAT(data){
       <div class="cs-trk"><div class="cs-bar" style="width:${sp}%;background:${col}"></div></div>
       <span class="cs-cnt">${cnt}</span></div>`;
   }).join('');
-  const pr=(dist[5]||0)+(dist[4]||0),dt=(dist[1]||0)+(dist[2]||0);
-  const nps=tot?Math.round((pr-dt)/tot*100):0;
-  det.innerHTML=bars+`<div class="kg g3" style="margin-top:16px;">
-    <div class="kpi"><div class="kn">${tot}</div><div class="kl">Répondants</div></div>
-    <div class="kpi ${nps<0?'red':''}"><div class="kn">${nps>0?'+':''}${nps}</div><div class="kl">NPS</div></div>
-    <div class="kpi"><div class="kn">${Math.round(pct)}%</div><div class="kl">Satisfaits</div></div>
-  </div>`;
+  det.innerHTML=bars;
 }
 
 function rProj(data){
-  const ps=data.projects||[],ec=ps.filter(p=>!/termin|clos|resolv/i.test(p.status||'')),te=ps.filter(p=>/termin|clos|resolv/i.test(p.status||''));
-  const rows=ps.slice(0,8).map(p=>`<tr><td>${p.name||'—'}</td><td>${catP(p.category)}</td><td>${stP(p.status)}</td>
-    <td style="color:#bbb;font-size:11px;">${p.start_date?new Date(p.start_date).toLocaleDateString('fr-FR'):'—'}</td></tr>`);
+  const ps=data.projects||[];
+  const isClos=s=>/termin|clos|resolv/i.test(s||'');
+  const ec=ps.filter(p=>!isClos(p.status)),te=ps.filter(p=>isClos(p.status));
+  // Regrouper par catégorie
+  const byCat={};
+  ps.forEach(p=>{
+    const cat=p.category||'AUTRE';
+    if(!byCat[cat])byCat[cat]={ec:0,cl:0};
+    isClos(p.status)?byCat[cat].cl++:byCat[cat].ec++;
+  });
+  const cats=Object.keys(byCat);
+  const rows=cats.map(cat=>`<tr>
+    <td>${catP(cat)}</td>
+    <td style="text-align:center;font-weight:600;color:#a85e20;">${byCat[cat].ec||0}</td>
+    <td style="text-align:center;font-weight:600;color:#2d7048;">${byCat[cat].cl||0}</td>
+    <td style="text-align:center;font-weight:600;">${(byCat[cat].ec||0)+(byCat[cat].cl||0)}</td></tr>`);
   document.getElementById('proj-w').innerHTML=
-    `<div class="kg g3"><div class="kpi"><div class="kn">${ps.length}</div><div class="kl">Total</div></div>
-    <div class="kpi org"><div class="kn">${ec.length}</div><div class="kl">En cours</div></div>
-    <div class="kpi"><div class="kn">${te.length}</div><div class="kl">Clôturés</div></div></div>`
-    +mkT(['Projet','Catégorie','Statut','Début'],rows)
-    +(ps.length>8?`<p style="font-size:10px;color:#bbb;text-align:right;margin-top:6px;">+ ${ps.length-8} autres</p>`:'');
+    `<div class="kg g3">
+      <div class="kpi"><div class="kn">${ps.length}</div><div class="kl">Total</div></div>
+      <div class="kpi org"><div class="kn">${ec.length}</div><div class="kl">En cours</div></div>
+      <div class="kpi"><div class="kn">${te.length}</div><div class="kl">Clôturés</div></div>
+    </div>`
+    +(cats.length?mkT(['Catégorie','En cours','Clôturés','Total'],rows):'');
 }
 
 function rEmails(data){
   const em=data.emails||{},bm=em.by_month||{},months=Object.keys(bm);
   document.getElementById('em-w').innerHTML=
-    `<div class="kg g3"><div class="kpi"><div class="kn">${em.total||0}</div><div class="kl">Emails reçus</div></div>
-    <div class="kpi"><div class="kn">${em.avg_response_hours?Math.round(em.avg_response_hours)+'h':'—'}</div><div class="kl">Délai moy. réponse</div></div>
-    <div class="kpi"><div class="kn">${em.response_rate?Math.round(em.response_rate*100)+'%':'—'}</div><div class="kl">Taux de réponse</div></div></div>`
+    `<div class="kg g3">
+      <div class="kpi"><div class="kn">${em.total||0}</div><div class="kl">Total</div></div>
+      <div class="kpi"><div class="kn">${em.received!=null?em.received:em.total||0}</div><div class="kl">Reçus</div></div>
+      <div class="kpi"><div class="kn">${em.sent||0}</div><div class="kl">Envoyés</div></div>
+    </div>`
     +(months.length>1?'<div class="chart-l"><canvas id="chart-em"></canvas></div>':'');
   if(months.length>1)setTimeout(()=>{
     if(EC){EC.destroy();EC=null;}
@@ -617,19 +657,27 @@ function rEmails(data){
 
 function rAppels(data){
   const c=data.calls||{};
-  document.getElementById('ap-w').innerHTML=`<div class="kg g4">
-    <div class="kpi"><div class="kn">${c.total||0}</div><div class="kl">Total</div></div>
-    <div class="kpi"><div class="kn">${c.inbound||0}</div><div class="kl">Entrants</div></div>
-    <div class="kpi"><div class="kn">${c.outbound||0}</div><div class="kl">Sortants</div></div>
-    <div class="kpi"><div class="kn">${c.avg_duration_seconds?Math.round(c.avg_duration_seconds/60)+' mn':'—'}</div><div class="kl">Durée moy.</div></div>
-  </div>`;
+  const svc=c.by_service||{};
+  const svcLabels={'gestion':'Gestion','comptabilité':'Comptabilité','juridique':'Juridique','support':'Support','autre':'Autre'};
+  const svcRows=Object.entries(svc)
+    .sort((a,b)=>b[1].count-a[1].count)
+    .map(([k,v])=>`<tr>
+      <td>${svcLabels[k]||k.charAt(0).toUpperCase()+k.slice(1)}</td>
+      <td style="text-align:center;font-weight:600;">${v.count||0}</td>
+      <td style="text-align:center;color:#888;font-size:11px;">${v.duration_seconds?+(v.duration_seconds/3600).toFixed(1)+'h':'—'}</td></tr>`);
+  document.getElementById('ap-w').innerHTML=
+    `<div class="kg g2">
+      <div class="kpi"><div class="kn">${c.total||0}</div><div class="kl">Total appels</div></div>
+      <div class="kpi"><div class="kn">${c.total_duration_hours!=null?c.total_duration_hours+'h':'—'}</div><div class="kl">Durée totale</div></div>
+    </div>`
+    +(svcRows.length?mkT(['Service','Appels','Durée'],svcRows):'');
 }
 
-function rAG(data){
-  const ass=data.assemblies||[],w=document.getElementById('ag-w');
-  if(!ass.length){w.innerHTML='<div class="empty">Aucune assemblée sur la période</div>';return;}
-  w.innerHTML=mkT(['Assemblée','Type','Date','Statut'],ass.map(a=>`<tr>
-    <td>${a.name||'AG'}</td><td>${pill(a.type||'AG','p-b')}</td>
+function rVisits(data){
+  const visits=data.visits||data.assemblies||[],w=document.getElementById('ag-w');
+  if(!visits.length){w.innerHTML='<div class="empty">Aucune visite sur la période</div>';return;}
+  w.innerHTML=mkT(['Visite / Assemblée','Type','Date','Statut'],visits.map(a=>`<tr>
+    <td>${a.name||'Visite'}</td><td>${pill(a.type||'Visite','p-b')}</td>
     <td style="font-size:11px;">${a.date?new Date(a.date).toLocaleDateString('fr-FR'):'—'}</td>
     <td>${stP(a.status||'Tenu')}</td></tr>`));
 }
@@ -637,13 +685,12 @@ function rAG(data){
 function rSin(data){
   const all=data.incidents||[],sin=all.filter(i=>/sinistre/i.test(i.category||i.type||''));
   const ouv=sin.filter(s=>!/clos|termin/i.test(s.status||'')),cl=sin.filter(s=>/clos|termin/i.test(s.status||''));
-  const rows=sin.slice(0,6).map(s=>`<tr><td>${s.name||s.description?.slice(0,50)||'—'}</td><td>${stP(s.status)}</td>
-    <td style="color:#bbb;font-size:11px;">${(s.date||s.created_at)?new Date(s.date||s.created_at).toLocaleDateString('fr-FR'):'—'}</td></tr>`);
+  const rows=sin.slice(0,6).map(s=>`<tr><td>${s.name||s.description?.slice(0,50)||'—'}</td><td>${stP(s.status)}</td></tr>`);
   document.getElementById('si-w').innerHTML=
     `<div class="kg g3"><div class="kpi"><div class="kn">${sin.length}</div><div class="kl">Total</div></div>
     <div class="kpi red"><div class="kn">${ouv.length}</div><div class="kl">En cours</div></div>
     <div class="kpi"><div class="kn">${cl.length}</div><div class="kl">Clôturés</div></div></div>`
-    +mkT(['Désignation','Statut','Date'],rows);
+    +mkT(['Désignation','Statut'],rows);
 }
 
 function rTr(data){
@@ -651,9 +698,8 @@ function rTr(data){
   const tr=all.filter(i=>/travaux/i.test(i.category||i.type||''));
   const w=document.getElementById('tr-w');
   if(!tr.length){w.innerHTML='<div class="empty">Aucun travail sur la période</div>';return;}
-  w.innerHTML=mkT(['Désignation','Statut','Date'],tr.slice(0,5).map(t=>`<tr>
-    <td>${t.name||t.title||'—'}</td><td>${stP(t.status)}</td>
-    <td style="color:#bbb;font-size:11px;">${(t.date||t.created_at)?new Date(t.date||t.created_at).toLocaleDateString('fr-FR'):'—'}</td></tr>`));
+  w.innerHTML=mkT(['Désignation','Statut'],tr.slice(0,5).map(t=>`<tr>
+    <td>${t.name||t.title||'—'}</td><td>${stP(t.status)}</td></tr>`));
 }
 
 function rGes(data){
@@ -662,12 +708,11 @@ function rGes(data){
   const cats=Object.keys(bc),w=document.getElementById('ge-w');
   const rows=g.slice(0,8).map(x=>`<tr>
     <td>${x.name||x.title||x.description?.slice(0,40)||'—'}</td>
-    <td>${catP(x.category)}</td><td>${stP(x.status)}</td>
-    <td style="color:#bbb;font-size:11px;">${(x.date||x.created_at)?new Date(x.date||x.created_at).toLocaleDateString('fr-FR'):'—'}</td></tr>`);
+    <td>${catP(x.category)}</td><td>${stP(x.status)}</td></tr>`);
   w.innerHTML=`<div class="kg g${Math.min(cats.length+1,4)}">
     <div class="kpi"><div class="kn">${g.length}</div><div class="kl">Dossiers</div></div>
     ${cats.slice(0,3).map(c=>`<div class="kpi">${catP(c)}<div class="kn" style="margin-top:4px;">${bc[c]}</div></div>`).join('')}
-  </div>`+mkT(['Désignation','Catégorie','Statut','Date'],rows);
+  </div>`+mkT(['Désignation','Catégorie','Statut'],rows);
 }
 
 // Auto-génère la démo au chargement
