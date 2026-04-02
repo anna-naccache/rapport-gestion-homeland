@@ -104,28 +104,26 @@ def list_items(data):
 # ─────────────────────────────────────────────
 
 def ringover_calls(cfg, date_start, date_end, building_name="", building_tags=None):
-    """Récupère tous les appels (entrants et sortants) sur la période."""
+    """Récupère tous les appels (sans filtre call_type) sur la période."""
     base, api_key = cfg["ringover"]["base_url"], cfg["ringover"]["api_key"]
-    calls = []
-    for call_type in ["inbound", "outbound"]:
-        offset = 0
-        while True:
-            try:
-                r = requests.get(f"{base}/calls",
-                    headers={"Authorization": api_key},
-                    params={"limit_count": 100, "limit_offset": offset,
-                            "period_start": f"{date_start}T00:00:00",
-                            "period_end":   f"{date_end}T23:59:59",
-                            "call_type":    call_type},
-                    timeout=20)
-                r.raise_for_status()
-                batch = r.json().get("callList", r.json().get("calls", []))
-                if not batch: break
-                calls.extend(batch)
-                if len(batch) < 100: break
-                offset += 100
-            except Exception as e:
-                print(f"  ⚠ Ringover ({call_type}): {e}"); break
+    calls, offset = [], 0
+    while True:
+        try:
+            r = requests.get(f"{base}/calls",
+                headers={"Authorization": api_key},
+                params={"limit_count": 100, "limit_offset": offset,
+                        "period_start": f"{date_start}T00:00:00",
+                        "period_end":   f"{date_end}T23:59:59"},
+                timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            batch = data.get("call_list", data.get("callList", data.get("calls", [])))
+            if not batch: break
+            calls.extend(batch)
+            if len(batch) < 100: break
+            offset += 100
+        except Exception as e:
+            print(f"  ⚠ Ringover: {e}"); break
     return calls
 
 # ─────────────────────────────────────────────
@@ -572,14 +570,14 @@ def debug_apis():
         base = cfg["hbo"]["base_url"]
         out["hbo"]["auth"] = "ok"
 
-        # Essais endpoints bâtiments
+        # Essais endpoints bâtiments / profil
         for label, method, path, body in [
-            ("POST /building/search name empty", "POST", "/building/search", {"name": ""}),
-            ("POST /building/search name null", "POST", "/building/search", {"name": None}),
-            ("POST /building/search active:true", "POST", "/building/search", {"active": True, "page": 1}),
-            ("GET /me/buildings", "GET", "/me/buildings", None),
-            ("GET /user/buildings", "GET", "/user/buildings", None),
-            ("GET /manager/buildings", "GET", "/manager/buildings", None),
+            ("GET /me", "GET", "/me", None),
+            ("GET /profile", "GET", "/profile", None),
+            ("GET /users/me", "GET", "/users/me", None),
+            ("GET /user/me", "GET", "/user/me", None),
+            ("POST /building/search city:Paris", "POST", "/building/search", {"city": "Paris"}),
+            ("POST /building/search city:Paris2", "POST", "/building/search", {"city": "Paris", "page": 1, "itemsPerPage": 10}),
         ]:
             try:
                 if method == "POST":
