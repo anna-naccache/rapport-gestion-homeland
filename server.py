@@ -574,11 +574,12 @@ def debug_apis():
 
         # Essais endpoints bâtiments
         for label, method, path, body in [
-            ("POST /building/search criteria:{}", "POST", "/building/search", {"criteria": {}, "page": 1, "itemsPerPage": 20}),
-            ("POST /building/search criteria:null", "POST", "/building/search", {"criteria": None, "page": 1, "itemsPerPage": 20}),
-            ("POST /building/search filters", "POST", "/building/search", {"filters": {}, "page": 1, "itemsPerPage": 20}),
-            ("GET /building/list", "GET", "/building/list", None),
-            ("GET /syndic/buildings", "GET", "/syndic/buildings", None),
+            ("POST /building/search name empty", "POST", "/building/search", {"name": ""}),
+            ("POST /building/search name null", "POST", "/building/search", {"name": None}),
+            ("POST /building/search active:true", "POST", "/building/search", {"active": True, "page": 1}),
+            ("GET /me/buildings", "GET", "/me/buildings", None),
+            ("GET /user/buildings", "GET", "/user/buildings", None),
+            ("GET /manager/buildings", "GET", "/manager/buildings", None),
         ]:
             try:
                 if method == "POST":
@@ -595,7 +596,7 @@ def debug_apis():
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        for call_type in ["ALL", "ANSWERED", None]:
+        for call_type in ["ANSWERED", "MISSED", "OUTBOUND", None]:
             params = {"limit_count": 3, "limit_offset": 0,
                       "period_start": f"{month_ago}T00:00:00",
                       "period_end": f"{today}T23:59:59"}
@@ -606,8 +607,6 @@ def debug_apis():
                 params=params, timeout=15)
             key = f"call_type={call_type or 'absent'}"
             out["ringover"][key] = {"status": r.status_code, "body": r.text[:300]}
-            if r.status_code == 200:
-                break
     except Exception as e:
         out["ringover"] = {"error": str(e)}
 
