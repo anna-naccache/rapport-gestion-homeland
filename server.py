@@ -13,6 +13,7 @@ import json, os, sys
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
@@ -62,7 +63,8 @@ def load_config():
 # HBO  (JWT cache 8h)
 # ─────────────────────────────────────────────
 
-_token_cache = {"token": None, "expires": datetime.min}
+_token_cache     = {"token": None, "expires": datetime.min}
+_buildings_cache = {"data": None, "expires": datetime.min}
 
 def hbo_token(cfg):
     now = datetime.now()
@@ -350,59 +352,64 @@ def satisfaction_to_v3(sat):
 def index():
     return send_from_directory(str(BASE_DIR), "rapport_v3.html")
 
+def _fetch_building_by_id(cfg, bid):
+    """Tente de récupérer un bâtiment par ID. Retourne None si inexistant/invalide."""
+    try:
+        b = hbo(cfg, f"/building/{bid}")
+        if not b or not b.get("id"):
+            return None
+        return b
+    except Exception:
+        return None
+
+def _scan_homeland_buildings(cfg):
+    """
+    Parcourt les IDs 50–1100 en parallèle pour trouver tous les bâtiments
+    Homeland (syndic_name contient 'homeland', status='client').
+    Résultat mis en cache 24h.
+    """
+    now = datetime.now()
+    if _buildings_cache["data"] is not None and now < _buildings_cache["expires"]:
+        return _buildings_cache["data"]
+
+    print("  🔍 Scan HBO buildings 50–1100 (parallel)…")
+    ids_to_scan = range(50, 1101)
+    found = []
+
+    def fetch(bid):
+        return _fetch_building_by_id(cfg, bid)
+
+    with ThreadPoolExecutor(max_workers=25) as ex:
+        futures = {ex.submit(fetch, bid): bid for bid in ids_to_scan}
+        for fut in as_completed(futures):
+            b = fut.result()
+            if b is None:
+                continue
+            # Filtrer par syndic Homeland + status client
+            syndic_raw = b.get("syndicName") or b.get("syndic_name") or ""
+            if isinstance(b.get("syndic"), dict):
+                syndic_raw = syndic_raw or b["syndic"].get("name", "")
+            status = str(b.get("status") or "").lower()
+            if "homeland" in syndic_raw.lower() and status == "client":
+                found.append({
+                    "id":      b["id"],
+                    "name":    b.get("name") or b.get("address") or f"#{b['id']}",
+                    "address": b.get("address") or "",
+                    "city":    b.get("city") or "",
+                })
+
+    found.sort(key=lambda x: x["id"])
+    print(f"  ✅ {len(found)} bâtiments Homeland trouvés")
+    _buildings_cache["data"]    = found
+    _buildings_cache["expires"] = now + timedelta(hours=24)
+    return found
+
 @app.route("/api/buildings")
 def get_buildings():
     try:
         cfg = load_config()
-        tok = hbo_token(cfg)
-        headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
-        base_url = cfg['hbo']['base_url']
-
-        buildings = []
-        # Essai 1 : POST /building/search avec pagination
-        try:
-            r = requests.post(f"{base_url}/building/search",
-                headers=headers,
-                json={"page": 1, "itemsPerPage": 50},
-                timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                buildings = list_items(data)
-        except Exception as e:
-            print(f"  ⚠ /building/search: {e}")
-
-        # Essai 2 : GET /buildings
-        if not buildings:
-            try:
-                r = requests.get(f"{base_url}/buildings", headers=headers, timeout=20)
-                if r.status_code == 200:
-                    data = r.json()
-                    buildings = list_items(data)
-            except Exception as e:
-                print(f"  ⚠ /buildings: {e}")
-
-        # Essai 3 : GET /coproprietes ou /syndic/buildings
-        if not buildings:
-            for endpoint in ["/coproprietes", "/syndic/buildings", "/building/list"]:
-                try:
-                    r = requests.get(f"{base_url}{endpoint}", headers=headers, timeout=20)
-                    if r.status_code == 200:
-                        buildings = list_items(r.json())
-                        if buildings: break
-                except Exception:
-                    pass
-
-        result = []
-        for b in buildings:
-            bid = b.get("id") or b.get("buildingId")
-            if not bid: continue
-            result.append({
-                "id":      bid,
-                "name":    b.get("name") or b.get("address") or f"#{bid}",
-                "address": b.get("address") or "",
-                "city":    b.get("city") or "",
-            })
-        return jsonify({"ok": True, "buildings": result})
+        buildings = _scan_homeland_buildings(cfg)
+        return jsonify({"ok": True, "buildings": buildings})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "buildings": []}), 200
 
@@ -420,30 +427,72 @@ def get_building_data(bid):
         date_start = ds_param or (now - timedelta(days=mois * 30)).strftime("%Y-%m-%d")
 
         # HBO — infos bâtiment
-        b       = hbo(cfg, f"/building/{bid}") or {}
-        projs   = list_items(hbo(cfg, f"/projects/{bid}", {"order": "desc"}))
-        incs    = list_items(hbo(cfg, "/incidents", {"building_id": bid}))
-        assembs = list_items(hbo(cfg, "/assemblies", {"building_id": bid}))
-        visits  = list_items(hbo(cfg, "/visits", {"building_id": bid}))
+        b = hbo(cfg, f"/building/{bid}") or {}
 
-        # Extraire gestionnaire et comptable
-        manager_field = b.get("manager") or b.get("gestionnaire") or {}
-        accountant_field = b.get("accountant") or b.get("comptable") or {}
-        if isinstance(manager_field, dict):
-            manager_name = (manager_field.get("firstName") or manager_field.get("first_name") or "") + " " + (manager_field.get("lastName") or manager_field.get("last_name") or "")
-            manager_name = manager_name.strip() or manager_field.get("name") or manager_field.get("email") or ""
-        else:
-            manager_name = str(manager_field)
-        if isinstance(accountant_field, dict):
-            accountant_name = (accountant_field.get("firstName") or accountant_field.get("first_name") or "") + " " + (accountant_field.get("lastName") or accountant_field.get("last_name") or "")
-            accountant_name = accountant_name.strip() or accountant_field.get("name") or accountant_field.get("email") or ""
-        else:
-            accountant_name = str(accountant_field)
+        # ── Gestionnaire et Comptable via admin_users ──
+        def admin_user_name(user_id):
+            """Retourne 'Prénom NOM' depuis /admin_users/{id}."""
+            if not user_id:
+                return ""
+            try:
+                u = hbo(cfg, f"/admin_users/{user_id}")
+                if not u:
+                    return ""
+                fname = u.get("firstname") or u.get("firstName") or u.get("first_name") or ""
+                lname = u.get("name") or u.get("lastName") or u.get("last_name") or ""
+                full  = f"{fname} {lname}".strip()
+                return full or u.get("email", "")
+            except Exception:
+                return ""
+
+        manager_id    = b.get("referentAdminUserId") or b.get("referent_admin_user_id")
+        accountant_id = b.get("accountantAdminUserId") or b.get("accountant_admin_user_id")
+
+        # Fetch en parallèle pour aller plus vite
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            f_mgr  = ex.submit(admin_user_name, manager_id)
+            f_acct = ex.submit(admin_user_name, accountant_id)
+            # Projets : /building/works/{bid} retourne les objets complets
+            f_works = ex.submit(lambda: list_items(hbo(cfg, f"/building/works/{bid}")))
+            # Projets génériques
+            f_projs = ex.submit(lambda: list_items(hbo(cfg, f"/projects/{bid}", {"order": "desc"})))
+            # Assemblées
+            f_assembs = ex.submit(lambda: list_items(hbo(cfg, "/assemblies", {"building_id": bid})))
+            # Visites
+            f_visits  = ex.submit(lambda: list_items(hbo(cfg, "/visits", {"building_id": bid})))
+            # Incidents/sinistres
+            f_incs = ex.submit(lambda: list_items(hbo(cfg, "/incidents", {"building_id": bid})))
+
+            manager_name    = f_mgr.result()
+            accountant_name = f_acct.result()
+            works   = f_works.result()
+            projs   = f_projs.result() if not works else works
+            assembs = f_assembs.result()
+            visits  = f_visits.result()
+            incs    = f_incs.result()
+
+        # Fallback si admin_user_name vide : lire depuis les champs imbriqués du bâtiment
+        if not manager_name:
+            mf = b.get("manager") or b.get("gestionnaire") or {}
+            if isinstance(mf, dict):
+                manager_name = (mf.get("firstName","") + " " + mf.get("name","")).strip()
+            else:
+                manager_name = str(mf)
+        if not accountant_name:
+            af = b.get("accountant") or b.get("comptable") or {}
+            if isinstance(af, dict):
+                accountant_name = (af.get("firstName","") + " " + af.get("name","")).strip()
+            else:
+                accountant_name = str(af)
 
         # Date de création / début de gestion
         created_at = b.get("createdAt") or b.get("created_at") or b.get("managedSince") or b.get("dateCreation") or ""
         if created_at:
             created_at = created_at[:10]
+
+        # Lots count — essayer plusieurs noms de champs
+        lots_count = (b.get("lots") or b.get("lotsCount") or b.get("lotsPrincipaux")
+                      or b.get("numberOfLots") or b.get("nb_lots") or 0)
 
         # Communications
         b_name = b.get("name", "")
@@ -462,9 +511,6 @@ def get_building_data(bid):
             "score": b.get("satisfactionScore") or b.get("satisfaction"),
             "notes": b.get("satisfactionNotes") or [],
         }
-
-        # Lots count
-        lots_count = b.get("lots") or b.get("lotsCount") or b.get("lotsPrincipaux") or 0
 
         result = {
             "building": {
@@ -556,69 +602,6 @@ def get_demo():
             {"name": "Visite conseil syndical",                      "type": "Visite","date": "2025-01-14", "status": "Effectuée"},
         ]
     })
-
-@app.route("/api/debug")
-def debug_apis():
-    """Test toutes les APIs et retourne les réponses brutes."""
-    cfg = load_config()
-    out = {"hbo": {}, "ringover": {}, "front": {}}
-
-    # ── HBO ──
-    try:
-        tok = hbo_token(cfg)
-        headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
-        base = cfg["hbo"]["base_url"]
-        out["hbo"]["auth"] = "ok"
-
-        # Essais endpoints bâtiments avec différents préfixes
-        for label, method, path, body in [
-            ("GET /v2/buildings", "GET", "/v2/buildings", None),
-            ("GET /v2/building", "GET", "/v2/building", None),
-            ("POST /v2/building/search {}", "POST", "/v2/building/search", {"page": 1, "itemsPerPage": 20}),
-            ("GET /v1/buildings", "GET", "/v1/buildings", None),
-            ("GET /api/buildings", "GET", "/api/buildings", None),
-            ("GET /building/1", "GET", "/building/1", None),
-        ]:
-            try:
-                if method == "POST":
-                    r = requests.post(f"{base}{path}", headers=headers, json=body, timeout=15)
-                else:
-                    r = requests.get(f"{base}{path}", headers=headers, timeout=15)
-                out["hbo"][label] = {"status": r.status_code, "body": r.text[:300]}
-            except Exception as e:
-                out["hbo"][label] = {"error": str(e)}
-    except Exception as e:
-        out["hbo"]["auth"] = f"ERREUR: {e}"
-
-    # ── Ringover ──
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        for call_type in ["ANSWERED", "MISSED", "OUTBOUND", None]:
-            params = {"limit_count": 3, "limit_offset": 0,
-                      "period_start": f"{month_ago}T00:00:00",
-                      "period_end": f"{today}T23:59:59"}
-            if call_type:
-                params["call_type"] = call_type
-            r = requests.get(f"{cfg['ringover']['base_url']}/calls",
-                headers={"Authorization": cfg["ringover"]["api_key"]},
-                params=params, timeout=15)
-            key = f"call_type={call_type or 'absent'}"
-            out["ringover"][key] = {"status": r.status_code, "body": r.text[:300]}
-    except Exception as e:
-        out["ringover"] = {"error": str(e)}
-
-    # ── Front ──
-    try:
-        r = requests.get(f"{cfg['front']['base_url']}/conversations",
-            headers={"Authorization": f"Bearer {cfg['front']['token']}", "Accept": "application/json"},
-            params={"limit": 5},
-            timeout=15)
-        out["front"] = {"status": r.status_code, "body": r.text[:500]}
-    except Exception as e:
-        out["front"] = {"error": str(e)}
-
-    return jsonify(out)
 
 @app.route("/health")
 def health():
