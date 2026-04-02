@@ -570,14 +570,14 @@ def debug_apis():
         base = cfg["hbo"]["base_url"]
         out["hbo"]["auth"] = "ok"
 
-        # Essais endpoints bâtiments / profil
+        # Essais endpoints bâtiments avec différents préfixes
         for label, method, path, body in [
-            ("GET /me", "GET", "/me", None),
-            ("GET /profile", "GET", "/profile", None),
-            ("GET /users/me", "GET", "/users/me", None),
-            ("GET /user/me", "GET", "/user/me", None),
-            ("POST /building/search city:Paris", "POST", "/building/search", {"city": "Paris"}),
-            ("POST /building/search city:Paris2", "POST", "/building/search", {"city": "Paris", "page": 1, "itemsPerPage": 10}),
+            ("GET /v2/buildings", "GET", "/v2/buildings", None),
+            ("GET /v2/building", "GET", "/v2/building", None),
+            ("POST /v2/building/search {}", "POST", "/v2/building/search", {"page": 1, "itemsPerPage": 20}),
+            ("GET /v1/buildings", "GET", "/v1/buildings", None),
+            ("GET /api/buildings", "GET", "/api/buildings", None),
+            ("GET /building/1", "GET", "/building/1", None),
         ]:
             try:
                 if method == "POST":
