@@ -296,7 +296,7 @@ def get_buildings():
             {"id": b.get("id"), "name": b.get("name") or b.get("address") or f"#{b.get('id')}"}
             for b in rows
         ]
-        return jsonify({"ok": True, "buildings": buildings})
+        return jsonify({"ok": True, "buildings": buildings, "_raw_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "buildings": []}), 200
 
