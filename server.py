@@ -290,13 +290,19 @@ def index():
 def get_buildings():
     try:
         cfg  = load_config()
+        # Debug: capture raw HBO response
+        import requests as _req
+        _tok = hbo_token(cfg)
+        _url = f"{cfg['hbo']['base_url']}/building/search"
+        _r = _req.post(_url, headers={"Authorization": f"Bearer {_tok}", "Content-Type": "application/json"}, json={}, timeout=20)
+        _debug = {"status": _r.status_code, "text": _r.text[:500]}
         data = hbo(cfg, "/building/search", method="POST", body={})
         rows = list_items(data)
         buildings = [
             {"id": b.get("id"), "name": b.get("name") or b.get("address") or f"#{b.get('id')}"}
             for b in rows
         ]
-        return jsonify({"ok": True, "buildings": buildings, "_raw_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__})
+        return jsonify({"ok": True, "buildings": buildings, "_debug": _debug})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "buildings": []}), 200
 
