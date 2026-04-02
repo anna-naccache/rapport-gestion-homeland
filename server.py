@@ -559,6 +559,66 @@ def get_demo():
         ]
     })
 
+@app.route("/api/debug")
+def debug_apis():
+    """Test toutes les APIs et retourne les réponses brutes."""
+    cfg = load_config()
+    out = {"hbo": {}, "ringover": {}, "front": {}}
+
+    # ── HBO ──
+    try:
+        tok = hbo_token(cfg)
+        headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+        base = cfg["hbo"]["base_url"]
+        out["hbo"]["auth"] = "ok"
+
+        # Essais endpoints bâtiments
+        for label, method, path, body in [
+            ("POST /building/search {page}", "POST", "/building/search", {"page": 1, "itemsPerPage": 20}),
+            ("POST /building/search {}", "POST", "/building/search", {}),
+            ("GET /buildings", "GET", "/buildings", None),
+            ("GET /building", "GET", "/building", None),
+            ("GET /coproprietes", "GET", "/coproprietes", None),
+        ]:
+            try:
+                if method == "POST":
+                    r = requests.post(f"{base}{path}", headers=headers, json=body, timeout=15)
+                else:
+                    r = requests.get(f"{base}{path}", headers=headers, timeout=15)
+                out["hbo"][label] = {"status": r.status_code, "body": r.text[:300]}
+            except Exception as e:
+                out["hbo"][label] = {"error": str(e)}
+    except Exception as e:
+        out["hbo"]["auth"] = f"ERREUR: {e}"
+
+    # ── Ringover ──
+    try:
+        from datetime import date
+        today = date.today().isoformat()
+        month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        r = requests.get(f"{cfg['ringover']['base_url']}/calls",
+            headers={"Authorization": cfg["ringover"]["api_key"]},
+            params={"limit_count": 5, "limit_offset": 0,
+                    "period_start": f"{month_ago}T00:00:00",
+                    "period_end": f"{today}T23:59:59",
+                    "call_type": "inbound"},
+            timeout=15)
+        out["ringover"] = {"status": r.status_code, "body": r.text[:500]}
+    except Exception as e:
+        out["ringover"] = {"error": str(e)}
+
+    # ── Front ──
+    try:
+        r = requests.get(f"{cfg['front']['base_url']}/conversations",
+            headers={"Authorization": f"Bearer {cfg['front']['token']}", "Accept": "application/json"},
+            params={"limit": 5},
+            timeout=15)
+        out["front"] = {"status": r.status_code, "body": r.text[:500]}
+    except Exception as e:
+        out["front"] = {"error": str(e)}
+
+    return jsonify(out)
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
