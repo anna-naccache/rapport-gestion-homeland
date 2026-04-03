@@ -352,54 +352,118 @@ def satisfaction_to_v3(sat):
 def index():
     return send_from_directory(str(BASE_DIR), "rapport_v3.html")
 
-def _fetch_building_by_id(cfg, bid):
-    """Tente de récupérer un bâtiment par ID. Retourne None si inexistant/invalide."""
-    try:
-        b = hbo(cfg, f"/building/{bid}")
-        if not b or not b.get("id"):
-            return None
-        return b
-    except Exception:
+def _building_summary(b):
+    """Extrait les champs affichés dans la liste déroulante."""
+    bid = b.get("id")
+    if not bid:
         return None
+    return {
+        "id":      bid,
+        "name":    b.get("name") or b.get("address") or f"#{bid}",
+        "address": b.get("address") or "",
+        "city":    b.get("city") or "",
+    }
+
+def _is_homeland_client(b):
+    """Retourne True si le bâtiment appartient au syndic Homeland et est actif (client)."""
+    status = str(b.get("status") or "").lower()
+    if status not in ("client", ""):   # accepter aussi "" si l'API ne filtre pas
+        return False
+    # Chercher "homeland" dans tous les champs syndic possibles
+    for field in ("syndicName", "syndic_name", "syndic"):
+        val = b.get(field)
+        if isinstance(val, dict):
+            val = val.get("name", "")
+        if val and "homeland" in str(val).lower():
+            return True
+    return False
+
+def _search_all_buildings(cfg):
+    """
+    Récupère toutes les copros via POST /building/search paginated.
+    Format confirmé : {"building": {critères}} → 200 OK.
+    Retourne une liste brute de bâtiments.
+    """
+    tok = hbo_token(cfg)
+    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+    base = cfg["hbo"]["base_url"]
+    all_buildings = []
+    page = 1
+    while True:
+        try:
+            r = requests.post(
+                f"{base}/building/search",
+                headers=headers,
+                json={"building": {}, "page": page, "itemsPerPage": 50},
+                timeout=25
+            )
+            if r.status_code != 200:
+                print(f"  ⚠ /building/search page {page}: {r.status_code}")
+                break
+            data = r.json()
+            items = list_items(data)
+            if not items:
+                break
+            all_buildings.extend(items)
+            # Pagination : s'arrêter si moins de 50 résultats ou si hydra:totalItems atteint
+            total = data.get("hydra:totalItems") or data.get("totalItems") or data.get("total")
+            if total and len(all_buildings) >= int(total):
+                break
+            if len(items) < 50:
+                break
+            page += 1
+        except Exception as e:
+            print(f"  ⚠ /building/search page {page}: {e}")
+            break
+    return all_buildings
 
 def _scan_homeland_buildings(cfg):
     """
-    Parcourt les IDs 50–1100 en parallèle pour trouver tous les bâtiments
-    Homeland (syndic_name contient 'homeland', status='client').
+    Stratégie 1 : POST /building/search paginé (rapide, quelques requêtes).
+    Stratégie 2 (fallback) : scan parallèle GET /building/{id} sur 50–1100.
     Résultat mis en cache 24h.
     """
     now = datetime.now()
     if _buildings_cache["data"] is not None and now < _buildings_cache["expires"]:
         return _buildings_cache["data"]
 
-    print("  🔍 Scan HBO buildings 50–1100 (parallel)…")
-    ids_to_scan = range(50, 1101)
     found = []
 
-    def fetch(bid):
-        return _fetch_building_by_id(cfg, bid)
-
-    with ThreadPoolExecutor(max_workers=25) as ex:
-        futures = {ex.submit(fetch, bid): bid for bid in ids_to_scan}
-        for fut in as_completed(futures):
-            b = fut.result()
-            if b is None:
-                continue
-            # Filtrer par syndic Homeland + status client
-            syndic_raw = b.get("syndicName") or b.get("syndic_name") or ""
-            if isinstance(b.get("syndic"), dict):
-                syndic_raw = syndic_raw or b["syndic"].get("name", "")
+    # ── Stratégie 1 : search paginé ──
+    print("  🔍 HBO building/search paginé…")
+    raw = _search_all_buildings(cfg)
+    if raw:
+        print(f"  → {len(raw)} bâtiments retournés par search")
+        # Si l'API est scopée au compte Homeland, tous les résultats sont bons
+        # On filtre quand même status=client par sécurité
+        for b in raw:
             status = str(b.get("status") or "").lower()
-            if "homeland" in syndic_raw.lower() and status == "client":
-                found.append({
-                    "id":      b["id"],
-                    "name":    b.get("name") or b.get("address") or f"#{b['id']}",
-                    "address": b.get("address") or "",
-                    "city":    b.get("city") or "",
-                })
+            if status in ("client", ""):
+                s = _building_summary(b)
+                if s:
+                    found.append(s)
+
+    # ── Stratégie 2 (fallback) : scan IDs si search renvoie rien ──
+    if not found:
+        print("  🔍 Fallback: scan HBO IDs 50–1100 (parallel)…")
+        def fetch(bid):
+            try:
+                b = hbo(cfg, f"/building/{bid}")
+                return b if (b and b.get("id")) else None
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=30) as ex:
+            futures = {ex.submit(fetch, bid): bid for bid in range(50, 1101)}
+            for fut in as_completed(futures):
+                b = fut.result()
+                if b and _is_homeland_client(b):
+                    s = _building_summary(b)
+                    if s:
+                        found.append(s)
 
     found.sort(key=lambda x: x["id"])
-    print(f"  ✅ {len(found)} bâtiments Homeland trouvés")
+    print(f"  ✅ {len(found)} bâtiments trouvés")
     _buildings_cache["data"]    = found
     _buildings_cache["expires"] = now + timedelta(hours=24)
     return found
@@ -412,6 +476,29 @@ def get_buildings():
         return jsonify({"ok": True, "buildings": buildings})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "buildings": []}), 200
+
+@app.route("/api/buildings/raw")
+def get_buildings_raw():
+    """Retourne la réponse brute de la 1ère page de /building/search pour debug."""
+    try:
+        cfg  = load_config()
+        tok  = hbo_token(cfg)
+        headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+        base = cfg["hbo"]["base_url"]
+        r = requests.post(
+            f"{base}/building/search",
+            headers=headers,
+            json={"building": {}, "page": 1, "itemsPerPage": 5},
+            timeout=25
+        )
+        return jsonify({
+            "status":  r.status_code,
+            "keys":    list(r.json().keys()) if r.status_code == 200 else [],
+            "total":   r.json().get("hydra:totalItems") or r.json().get("totalItems") or r.json().get("total") if r.status_code == 200 else None,
+            "sample":  r.json().get("hydra:member", r.json().get("member", r.json().get("items", [])))[:2] if r.status_code == 200 else r.text[:500],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/building/<int:bid>/data")
 def get_building_data(bid):
