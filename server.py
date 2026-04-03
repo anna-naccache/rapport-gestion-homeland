@@ -169,7 +169,7 @@ def front_convs(cfg, date_start, date_end):
     start_ts = int(datetime.strptime(date_start, "%Y-%m-%d").timestamp())
     end_ts   = int(datetime.strptime(date_end,   "%Y-%m-%d").timestamp())
     convs, page_token = [], None
-    while len(convs) < 5000:
+    while len(convs) < 500:   # plafonné à 500 pour éviter timeout
         params = {"q": f"after:{start_ts} before:{end_ts}", "limit": 100}
         if page_token: params["page_token"] = page_token
         try:
@@ -447,39 +447,41 @@ def _search_paged(cfg, criteria, page_size=50):
 def _run_id_scan(cfg):
     """Scan parallèle IDs 51–978 en arrière-plan, met à jour le cache."""
     global _scan_thread_running
-    print("  🔍 Background scan HBO IDs 51–978…")
-    found = []
-    tok = hbo_token(cfg)
-    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
-    base = cfg["hbo"]["base_url"]
+    try:
+        print("  🔍 Background scan HBO IDs 51–978…")
+        found = []
+        tok = hbo_token(cfg)
+        headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+        base = cfg["hbo"]["base_url"]
 
-    def fetch(bid):
-        try:
-            r = requests.get(f"{base}/building/{bid}", headers=headers, timeout=5)
-            if r.status_code != 200:
+        def fetch(bid):
+            try:
+                r = requests.get(f"{base}/building/{bid}", headers=headers, timeout=5)
+                if r.status_code != 200:
+                    return None
+                b = r.json()
+                return b if (b and b.get("id")) else None
+            except Exception:
                 return None
-            b = r.json()
-            return b if (b and b.get("id")) else None
-        except Exception:
-            return None
 
-    with ThreadPoolExecutor(max_workers=40) as ex:
-        futures = {ex.submit(fetch, bid): bid for bid in range(51, 979)}
-        for fut in as_completed(futures):
-            b = fut.result()
-            if b and b.get("id"):
-                # L'API est scopée au compte Homeland — on garde tout bâtiment valide
-                # (pas de filtre sur status : le champ peut varier selon la version API)
-                s = _building_summary(b)
-                if s:
-                    found.append(s)
+        with ThreadPoolExecutor(max_workers=40) as ex:
+            futures = {ex.submit(fetch, bid): bid for bid in range(51, 979)}
+            for fut in as_completed(futures):
+                b = fut.result()
+                if b and b.get("id"):
+                    s = _building_summary(b)
+                    if s:
+                        found.append(s)
 
-    found.sort(key=lambda x: x["id"])
-    print(f"  ✅ Scan terminé : {len(found)} bâtiments")
-    _buildings_cache["data"]    = found
-    _buildings_cache["expires"] = datetime.now() + timedelta(hours=24)
-    _save_disk_cache(found)
-    _scan_thread_running = False
+        found.sort(key=lambda x: x["id"])
+        print(f"  ✅ Scan terminé : {len(found)} bâtiments")
+        _buildings_cache["data"]    = found
+        _buildings_cache["expires"] = datetime.now() + timedelta(hours=24)
+        _save_disk_cache(found)
+    except Exception as e:
+        print(f"  ⚠ Scan error: {e}")
+    finally:
+        _scan_thread_running = False  # toujours resetter même si exception
 
 def _scan_homeland_buildings(cfg):
     """
