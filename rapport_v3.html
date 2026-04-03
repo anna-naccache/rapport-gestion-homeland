@@ -633,10 +633,9 @@ function sdcRenderTags(){
 
 function sdcUpdateBtn(){
   const btn=document.getElementById('btn-g');
+  const lbl=btn.querySelector('span');
   const n=_selected.size;
-  if(n===0){btn.querySelector('span')||btn.childNodes[btn.childNodes.length-1];btn.lastChild.textContent=' Générer le rapport';}
-  else if(n===1){btn.lastChild.textContent=' Générer le rapport';}
-  else{btn.lastChild.textContent=` Générer ${n} rapports`;}
+  lbl.textContent=n>1?` Générer ${n} rapports`:' Générer le rapport';
 }
 
 async function loadBuildings(retry){

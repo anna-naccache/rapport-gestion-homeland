@@ -436,14 +436,12 @@ def _run_id_scan(cfg):
         futures = {ex.submit(fetch, bid): bid for bid in range(51, 979)}
         for fut in as_completed(futures):
             b = fut.result()
-            if b:
-                # Pas de filtre syndic — l'API est déjà scopée au compte Homeland
-                # On garde tous les bâtiments avec status "client" ou actifs
-                status = str(b.get("status") or "").lower()
-                if status == "client" and b.get("id"):
-                    s = _building_summary(b)
-                    if s:
-                        found.append(s)
+            if b and b.get("id"):
+                # L'API est scopée au compte Homeland — on garde tout bâtiment valide
+                # (pas de filtre sur status : le champ peut varier selon la version API)
+                s = _building_summary(b)
+                if s:
+                    found.append(s)
 
     found.sort(key=lambda x: x["id"])
     print(f"  ✅ Scan background terminé : {len(found)} bâtiments")
