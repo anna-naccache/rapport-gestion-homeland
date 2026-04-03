@@ -66,6 +66,37 @@ def load_config():
 _token_cache     = {"token": None, "expires": datetime.min}
 _buildings_cache = {"data": None, "expires": datetime.min}
 
+BUILDINGS_CACHE_FILE = BASE_DIR / "buildings_cache.json"
+
+def _load_disk_cache():
+    """Charge le cache bâtiments depuis le disque si valide (< 24h)."""
+    try:
+        if BUILDINGS_CACHE_FILE.exists():
+            with open(BUILDINGS_CACHE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            expires = datetime.fromisoformat(d.get("expires", "2000-01-01"))
+            if datetime.now() < expires and d.get("data"):
+                _buildings_cache["data"]    = d["data"]
+                _buildings_cache["expires"] = expires
+                print(f"  💾 Cache disque chargé : {len(d['data'])} bâtiments")
+                return True
+    except Exception as e:
+        print(f"  ⚠ Lecture cache disque: {e}")
+    return False
+
+def _save_disk_cache(data):
+    """Sauvegarde le cache bâtiments sur disque."""
+    try:
+        expires = datetime.now() + timedelta(hours=24)
+        with open(BUILDINGS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"data": data, "expires": expires.isoformat()}, f, ensure_ascii=False)
+        print(f"  💾 Cache disque sauvegardé : {len(data)} bâtiments")
+    except Exception as e:
+        print(f"  ⚠ Écriture cache disque: {e}")
+
+# Charger le cache disque au démarrage
+_load_disk_cache()
+
 def hbo_token(cfg):
     now = datetime.now()
     if _token_cache["token"] and now < _token_cache["expires"]:
@@ -444,9 +475,10 @@ def _run_id_scan(cfg):
                     found.append(s)
 
     found.sort(key=lambda x: x["id"])
-    print(f"  ✅ Scan background terminé : {len(found)} bâtiments")
+    print(f"  ✅ Scan terminé : {len(found)} bâtiments")
     _buildings_cache["data"]    = found
     _buildings_cache["expires"] = datetime.now() + timedelta(hours=24)
+    _save_disk_cache(found)
     _scan_thread_running = False
 
 def _scan_homeland_buildings(cfg):
@@ -737,6 +769,10 @@ def _warmup():
     try:
         cfg = load_config()
         if not cfg.get("hbo"):
+            return
+        # Cache disque déjà valide → pas besoin de rescan
+        if _buildings_cache["data"] and datetime.now() < _buildings_cache["expires"]:
+            print("  ✅ Cache disque valide, pas de rescan au démarrage")
             return
         print("  🔥 Warmup: scan bâtiments au démarrage…")
         _run_id_scan(cfg)
