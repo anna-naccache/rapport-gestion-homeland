@@ -709,6 +709,16 @@ def get_demo():
         ]
     })
 
+@app.route("/api/buildings/status")
+def buildings_status():
+    return jsonify({
+        "scanning":      _scan_thread_running,
+        "cached":        _buildings_cache["data"] is not None,
+        "count":         len(_buildings_cache["data"] or []),
+        "cache_expires": str(_buildings_cache["expires"]),
+        "sample":        (_buildings_cache["data"] or [])[:3],
+    })
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
@@ -716,6 +726,24 @@ def health():
 # ─────────────────────────────────────────────
 # START
 # ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# WARMUP : lancer le scan bâtiments au démarrage
+# Comme ça quand la première requête arrive, le cache est déjà chaud.
+# ─────────────────────────────────────────────
+
+def _warmup():
+    try:
+        cfg = load_config()
+        if not cfg.get("hbo"):
+            return
+        print("  🔥 Warmup: scan bâtiments au démarrage…")
+        _run_id_scan(cfg)
+    except Exception as e:
+        print(f"  ⚠ Warmup error: {e}")
+
+import threading as _threading
+_threading.Thread(target=_warmup, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5055))
