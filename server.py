@@ -105,18 +105,18 @@ def list_items(data):
 # RINGOVER
 # ─────────────────────────────────────────────
 
-def ringover_calls(cfg, date_start, date_end, building_name="", building_tags=None):
-    """Récupère tous les appels (sans filtre call_type) sur la période."""
+def ringover_calls(cfg, date_start, date_end, building_name="", building_tags=None, max_calls=2000):
+    """Récupère les appels Ringover sur la période (plafonné à max_calls)."""
     base, api_key = cfg["ringover"]["base_url"], cfg["ringover"]["api_key"]
     calls, offset = [], 0
-    while True:
+    while len(calls) < max_calls:
         try:
             r = requests.get(f"{base}/calls",
                 headers={"Authorization": api_key},
                 params={"limit_count": 100, "limit_offset": offset,
                         "period_start": f"{date_start}T00:00:00",
                         "period_end":   f"{date_end}T23:59:59"},
-                timeout=20)
+                timeout=15)
             r.raise_for_status()
             data = r.json()
             batch = data.get("call_list", data.get("callList", data.get("calls", [])))
@@ -525,8 +525,19 @@ def get_building_data(bid):
         now  = datetime.now()
 
         # Période depuis les paramètres URL ou config
-        ds_param = request.args.get("date_start")
-        de_param = request.args.get("date_end")
+        # Normalise YYYY-MM (input type=month) → YYYY-MM-DD
+        def norm_date(d, end=False):
+            if not d: return d
+            if len(d) == 7:  # YYYY-MM
+                if end:
+                    from calendar import monthrange
+                    y, m = int(d[:4]), int(d[5:])
+                    return f"{d}-{monthrange(y,m)[1]:02d}"
+                return f"{d}-01"
+            return d
+
+        ds_param = norm_date(request.args.get("date_start"), end=False)
+        de_param = norm_date(request.args.get("date_end"),   end=True)
         date_end   = de_param or now.strftime("%Y-%m-%d")
         date_start = ds_param or (now - timedelta(days=mois * 30)).strftime("%Y-%m-%d")
 
@@ -552,20 +563,19 @@ def get_building_data(bid):
         manager_id    = b.get("referentAdminUserId") or b.get("referent_admin_user_id")
         accountant_id = b.get("accountantAdminUserId") or b.get("accountant_admin_user_id")
 
-        # Fetch en parallèle pour aller plus vite
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            f_mgr  = ex.submit(admin_user_name, manager_id)
-            f_acct = ex.submit(admin_user_name, accountant_id)
-            # Projets : /building/works/{bid} retourne les objets complets
-            f_works = ex.submit(lambda: list_items(hbo(cfg, f"/building/works/{bid}")))
-            # Projets génériques
-            f_projs = ex.submit(lambda: list_items(hbo(cfg, f"/projects/{bid}", {"order": "desc"})))
-            # Assemblées
+        b_name = b.get("name", "")
+
+        # Tout en parallèle : HBO + Ringover + Front
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            f_mgr     = ex.submit(admin_user_name, manager_id)
+            f_acct    = ex.submit(admin_user_name, accountant_id)
+            f_works   = ex.submit(lambda: list_items(hbo(cfg, f"/building/works/{bid}")))
+            f_projs   = ex.submit(lambda: list_items(hbo(cfg, f"/projects/{bid}", {"order": "desc"})))
             f_assembs = ex.submit(lambda: list_items(hbo(cfg, "/assemblies", {"building_id": bid})))
-            # Visites
-            f_visits  = ex.submit(lambda: list_items(hbo(cfg, "/visits", {"building_id": bid})))
-            # Incidents/sinistres
-            f_incs = ex.submit(lambda: list_items(hbo(cfg, "/incidents", {"building_id": bid})))
+            f_visits  = ex.submit(lambda: list_items(hbo(cfg, "/visits",     {"building_id": bid})))
+            f_incs    = ex.submit(lambda: list_items(hbo(cfg, "/incidents",  {"building_id": bid})))
+            f_calls   = ex.submit(ringover_calls, cfg, date_start, date_end, b_name)
+            f_emails  = ex.submit(front_convs,    cfg, date_start, date_end)
 
             manager_name    = f_mgr.result()
             accountant_name = f_acct.result()
@@ -574,41 +584,34 @@ def get_building_data(bid):
             assembs = f_assembs.result()
             visits  = f_visits.result()
             incs    = f_incs.result()
+            all_calls  = f_calls.result()
+            all_emails = f_emails.result()
 
-        # Fallback si admin_user_name vide : lire depuis les champs imbriqués du bâtiment
+        # Fallback noms si admin_users vide
         if not manager_name:
             mf = b.get("manager") or b.get("gestionnaire") or {}
-            if isinstance(mf, dict):
-                manager_name = (mf.get("firstName","") + " " + mf.get("name","")).strip()
-            else:
-                manager_name = str(mf)
+            manager_name = ((mf.get("firstName","")+" "+mf.get("name","")).strip()
+                            if isinstance(mf, dict) else str(mf))
         if not accountant_name:
             af = b.get("accountant") or b.get("comptable") or {}
-            if isinstance(af, dict):
-                accountant_name = (af.get("firstName","") + " " + af.get("name","")).strip()
-            else:
-                accountant_name = str(af)
+            accountant_name = ((af.get("firstName","")+" "+af.get("name","")).strip()
+                               if isinstance(af, dict) else str(af))
 
         # Date de création / début de gestion
-        created_at = b.get("createdAt") or b.get("created_at") or b.get("managedSince") or b.get("dateCreation") or ""
-        if created_at:
-            created_at = created_at[:10]
+        created_at = (b.get("createdAt") or b.get("created_at") or
+                      b.get("managedSince") or b.get("dateCreation") or "")
+        if created_at: created_at = created_at[:10]
 
-        # Lots count — essayer plusieurs noms de champs
+        # Lots
         lots_count = (b.get("lots") or b.get("lotsCount") or b.get("lotsPrincipaux")
                       or b.get("numberOfLots") or b.get("nb_lots") or 0)
 
-        # Communications
-        b_name = b.get("name", "")
-        building_tags = [b_name[:6].lower()] if b_name else []
-
-        all_calls  = ringover_calls(cfg, date_start, date_end, building_name=b_name, building_tags=building_tags)
-        all_emails = front_convs(cfg, date_start, date_end)
-
         # Filtrer par bâtiment si possible
-        bcalls  = [c for c in all_calls  if str(c.get("building_id","")) == str(bid)] or all_calls
-        bemails = [e for e in all_emails if str(e.get("building_id","")) == str(bid)
-                   or b_name[:6].lower() in str(e.get("subject","")).lower()] or all_emails
+        bcalls  = ([c for c in all_calls if str(c.get("building_id","")) == str(bid)]
+                   or all_calls)
+        bemails = ([e for e in all_emails if str(e.get("building_id","")) == str(bid)
+                    or b_name[:6].lower() in str(e.get("subject","")).lower()]
+                   or all_emails)
 
         # Satisfaction
         sat_raw = {
