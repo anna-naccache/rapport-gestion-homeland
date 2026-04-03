@@ -71,11 +71,13 @@ body{
   pointer-events:none;color:#bbb;transition:transform .2s;
 }
 .sdc-wrap.open .sdc-chevron{transform:translateY(-50%) rotate(180deg);}
+/* fixed pour éviter le clipping par overflow:auto du sidebar */
 .sdc-dropdown{
-  display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:200;
+  display:none;position:fixed;z-index:9999;
   background:#fff;border:1px solid #e0dbd5;border-radius:8px;
-  box-shadow:0 8px 24px rgba(0,0,0,.12);
-  max-height:220px;overflow-y:auto;
+  box-shadow:0 8px 24px rgba(0,0,0,.16);
+  max-height:240px;overflow-y:auto;
+  width:232px;
 }
 .sdc-wrap.open .sdc-dropdown{display:block;}
 .sdc-opt{
@@ -591,9 +593,7 @@ let _selected=new Set(); // IDs sélectionnés
 
 const DEMO_B={id:'demo',name:"34-36 Bd de l'Hôpital",address:"75005 Paris",city:"Paris"};
 
-function sdcOpen(){document.getElementById('sdc-wrap').classList.add('open');}
 function sdcClose(){document.getElementById('sdc-wrap').classList.remove('open');}
-function sdcToggle(){document.getElementById('sdc-wrap').classList.toggle('open');}
 
 function sdcRenderDropdown(q){
   const dd=document.getElementById('sdc-dropdown');
@@ -661,15 +661,30 @@ async function loadBuildings(retry){
   }catch(_){}
 }
 
+/* ── Positionnement fixed du dropdown ── */
+function sdcPositionDropdown(){
+  const input=document.getElementById('sdc-search');
+  const dd=document.getElementById('sdc-dropdown');
+  const rect=input.getBoundingClientRect();
+  dd.style.top=(rect.bottom+4)+'px';
+  dd.style.left=rect.left+'px';
+  dd.style.width=rect.width+'px';
+}
+
+function sdcOpen(){
+  sdcPositionDropdown();
+  sdcRenderDropdown(document.getElementById('sdc-search').value);
+  document.getElementById('sdc-wrap').classList.add('open');
+}
+
 /* ── Événements du composant ── */
 document.addEventListener('DOMContentLoaded',()=>{
   const search=document.getElementById('sdc-search');
   const wrap=document.getElementById('sdc-wrap');
   search.addEventListener('focus',sdcOpen);
-  search.addEventListener('input',e=>{sdcOpen();sdcRenderDropdown(e.target.value);});
-  document.addEventListener('click',e=>{if(!wrap.contains(e.target))sdcClose();});
-  // Clic sur la flèche/input ouvre/ferme
-  search.addEventListener('click',e=>{if(document.getElementById('sdc-wrap').classList.contains('open')&&!e.target.value)sdcClose();else sdcOpen();});
+  search.addEventListener('input',e=>{sdcPositionDropdown();sdcRenderDropdown(e.target.value);document.getElementById('sdc-wrap').classList.add('open');});
+  document.addEventListener('click',e=>{if(!wrap.contains(e.target)&&!document.getElementById('sdc-dropdown').contains(e.target))sdcClose();});
+  window.addEventListener('scroll',()=>{if(document.getElementById('sdc-wrap').classList.contains('open'))sdcPositionDropdown();},true);
 });
 function ss(m,c=''){const e=document.getElementById('st');e.textContent=m;e.className=c;}
 async function fetchBuildingData(id,ds,de){
