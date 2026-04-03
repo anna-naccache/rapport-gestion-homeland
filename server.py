@@ -378,125 +378,164 @@ def _is_homeland_client(b):
             return True
     return False
 
-def _search_all_buildings(cfg):
-    """
-    Récupère toutes les copros via POST /building/search paginated.
-    Format confirmé : {"building": {critères}} → 200 OK.
-    Retourne une liste brute de bâtiments.
-    """
+_scan_thread_running = False
+
+def _search_paged(cfg, criteria, page_size=50):
+    """POST /building/search avec critères donnés, paginé. Retourne [] si refusé."""
     tok = hbo_token(cfg)
     headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
     base = cfg["hbo"]["base_url"]
-    all_buildings = []
-    page = 1
+    all_items, page = [], 1
     while True:
         try:
             r = requests.post(
                 f"{base}/building/search",
                 headers=headers,
-                json={"building": {}, "page": page, "itemsPerPage": 50},
+                json={"building": criteria, "page": page, "itemsPerPage": page_size},
                 timeout=25
             )
             if r.status_code != 200:
-                print(f"  ⚠ /building/search page {page}: {r.status_code}")
-                break
+                return []
             data = r.json()
             items = list_items(data)
             if not items:
                 break
-            all_buildings.extend(items)
-            # Pagination : s'arrêter si moins de 50 résultats ou si hydra:totalItems atteint
-            total = data.get("hydra:totalItems") or data.get("totalItems") or data.get("total")
-            if total and len(all_buildings) >= int(total):
+            all_items.extend(items)
+            total = (data.get("hydra:totalItems") or data.get("totalItems")
+                     or data.get("total") or 0)
+            if total and len(all_items) >= int(total):
                 break
-            if len(items) < 50:
+            if len(items) < page_size:
                 break
             page += 1
         except Exception as e:
             print(f"  ⚠ /building/search page {page}: {e}")
             break
-    return all_buildings
+    return all_items
 
-def _scan_homeland_buildings(cfg):
-    """
-    Stratégie 1 : POST /building/search paginé (rapide, quelques requêtes).
-    Stratégie 2 (fallback) : scan parallèle GET /building/{id} sur 50–1100.
-    Résultat mis en cache 24h.
-    """
-    now = datetime.now()
-    if _buildings_cache["data"] is not None and now < _buildings_cache["expires"]:
-        return _buildings_cache["data"]
-
+def _run_id_scan(cfg):
+    """Scan parallèle IDs 51–978 en arrière-plan, met à jour le cache."""
+    global _scan_thread_running
+    print("  🔍 Background scan HBO IDs 51–978…")
     found = []
 
-    # ── Stratégie 1 : search paginé ──
-    print("  🔍 HBO building/search paginé…")
-    raw = _search_all_buildings(cfg)
-    if raw:
-        print(f"  → {len(raw)} bâtiments retournés par search")
-        # Si l'API est scopée au compte Homeland, tous les résultats sont bons
-        # On filtre quand même status=client par sécurité
-        for b in raw:
-            status = str(b.get("status") or "").lower()
-            if status in ("client", ""):
-                s = _building_summary(b)
-                if s:
-                    found.append(s)
+    def fetch(bid):
+        try:
+            b = hbo(cfg, f"/building/{bid}")
+            return b if (b and b.get("id")) else None
+        except Exception:
+            return None
 
-    # ── Stratégie 2 (fallback) : scan IDs si search renvoie rien ──
-    if not found:
-        print("  🔍 Fallback: scan HBO IDs 50–1100 (parallel)…")
-        def fetch(bid):
-            try:
-                b = hbo(cfg, f"/building/{bid}")
-                return b if (b and b.get("id")) else None
-            except Exception:
-                return None
-
-        with ThreadPoolExecutor(max_workers=30) as ex:
-            futures = {ex.submit(fetch, bid): bid for bid in range(50, 1101)}
-            for fut in as_completed(futures):
-                b = fut.result()
-                if b and _is_homeland_client(b):
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        futures = {ex.submit(fetch, bid): bid for bid in range(51, 979)}
+        for fut in as_completed(futures):
+            b = fut.result()
+            if b:
+                status = str(b.get("status") or "").lower()
+                # Accepter status=client, ou si status vide on garde aussi
+                if status in ("client", "") and b.get("id"):
                     s = _building_summary(b)
                     if s:
                         found.append(s)
 
     found.sort(key=lambda x: x["id"])
-    print(f"  ✅ {len(found)} bâtiments trouvés")
+    print(f"  ✅ Scan background terminé : {len(found)} bâtiments")
     _buildings_cache["data"]    = found
-    _buildings_cache["expires"] = now + timedelta(hours=24)
-    return found
+    _buildings_cache["expires"] = datetime.now() + timedelta(hours=24)
+    _scan_thread_running = False
+
+def _scan_homeland_buildings(cfg):
+    """
+    Stratégie 1 : POST /building/search avec divers critères.
+    Stratégie 2 : scan parallèle IDs en background + retour cache immédiat.
+    Cache 24h.
+    """
+    global _scan_thread_running
+    now = datetime.now()
+
+    # Cache valide → retour immédiat
+    if _buildings_cache["data"] is not None and now < _buildings_cache["expires"]:
+        return _buildings_cache["data"]
+
+    found = []
+
+    # ── Stratégie 1 : essayer plusieurs critères (l'API exige au moins 1) ──
+    for criteria in [
+        {"status": "client"},
+        {"name": " "},
+        {"name": ""},
+        {"city": "Paris"},
+    ]:
+        print(f"  🔍 /building/search {criteria}…")
+        raw = _search_paged(cfg, criteria)
+        if raw:
+            print(f"  → {len(raw)} résultats avec {criteria}")
+            for b in raw:
+                s = _building_summary(b)
+                if s and not any(x["id"] == s["id"] for x in found):
+                    found.append(s)
+            break   # premier critère qui fonctionne suffit
+
+    if found:
+        found.sort(key=lambda x: x["id"])
+        print(f"  ✅ {len(found)} bâtiments via search")
+        _buildings_cache["data"]    = found
+        _buildings_cache["expires"] = now + timedelta(hours=24)
+        return found
+
+    # ── Stratégie 2 : scan ID en background, retour immédiat ──
+    if not _scan_thread_running:
+        _scan_thread_running = True
+        import threading
+        t = threading.Thread(target=_run_id_scan, args=(cfg,), daemon=True)
+        t.start()
+        print("  🔄 Scan background lancé")
+
+    # Retourner ce qu'on a en cache (vide si premier appel)
+    return _buildings_cache["data"] or []
 
 @app.route("/api/buildings")
 def get_buildings():
     try:
         cfg = load_config()
         buildings = _scan_homeland_buildings(cfg)
-        return jsonify({"ok": True, "buildings": buildings})
+        return jsonify({
+            "ok":       True,
+            "buildings": buildings,
+            "scanning": _scan_thread_running,   # true = scan en cours, refaire un appel dans 15s
+        })
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "buildings": []}), 200
+        return jsonify({"ok": False, "error": str(e), "buildings": [], "scanning": False}), 200
 
 @app.route("/api/buildings/raw")
 def get_buildings_raw():
-    """Retourne la réponse brute de la 1ère page de /building/search pour debug."""
+    """Teste plusieurs critères /building/search et retourne les résultats bruts."""
     try:
         cfg  = load_config()
         tok  = hbo_token(cfg)
         headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
         base = cfg["hbo"]["base_url"]
-        r = requests.post(
-            f"{base}/building/search",
-            headers=headers,
-            json={"building": {}, "page": 1, "itemsPerPage": 5},
-            timeout=25
-        )
-        return jsonify({
-            "status":  r.status_code,
-            "keys":    list(r.json().keys()) if r.status_code == 200 else [],
-            "total":   r.json().get("hydra:totalItems") or r.json().get("totalItems") or r.json().get("total") if r.status_code == 200 else None,
-            "sample":  r.json().get("hydra:member", r.json().get("member", r.json().get("items", [])))[:2] if r.status_code == 200 else r.text[:500],
-        })
+        results = {}
+        for label, body in [
+            ("status_client",   {"building": {"status": "client"}, "page": 1, "itemsPerPage": 3}),
+            ("name_empty",      {"building": {"name": ""}, "page": 1, "itemsPerPage": 3}),
+            ("name_space",      {"building": {"name": " "}, "page": 1, "itemsPerPage": 3}),
+            ("city_paris",      {"building": {"city": "Paris"}, "page": 1, "itemsPerPage": 3}),
+            ("empty_criteria",  {"building": {}, "page": 1, "itemsPerPage": 3}),
+        ]:
+            try:
+                r = requests.post(f"{base}/building/search", headers=headers, json=body, timeout=20)
+                d = r.json() if r.status_code == 200 else {}
+                results[label] = {
+                    "status": r.status_code,
+                    "total":  d.get("hydra:totalItems") or d.get("totalItems") or d.get("total"),
+                    "count":  len(list_items(d)),
+                    "first":  list_items(d)[0].get("name","?") if list_items(d) else None,
+                    "raw":    r.text[:200],
+                }
+            except Exception as e:
+                results[label] = {"error": str(e)}
+        return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
