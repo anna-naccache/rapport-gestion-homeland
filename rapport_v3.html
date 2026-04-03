@@ -527,8 +527,8 @@ async function loadBuildings(retry){
       sel.innerHTML='<option value="">— Sélectionner —</option>';
       (json.buildings||[]).forEach(b=>{const o=document.createElement('option');o.value=b.id;o.textContent=b.name;sel.appendChild(o);});
       // Si scan en cours côté serveur, relancer dans 15s
-      if(json.scanning && (json.buildings||[]).length===0){
-        setTimeout(()=>loadBuildings(true),15000);
+      if(json.scanning || (json.buildings||[]).length===0){
+        setTimeout(()=>loadBuildings(true),10000);
       }
     }
   }catch(_){sel.innerHTML='<option value="">— Sélectionner —</option>';}

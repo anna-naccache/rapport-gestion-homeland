@@ -418,22 +418,29 @@ def _run_id_scan(cfg):
     global _scan_thread_running
     print("  🔍 Background scan HBO IDs 51–978…")
     found = []
+    tok = hbo_token(cfg)
+    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+    base = cfg["hbo"]["base_url"]
 
     def fetch(bid):
         try:
-            b = hbo(cfg, f"/building/{bid}")
+            r = requests.get(f"{base}/building/{bid}", headers=headers, timeout=5)
+            if r.status_code != 200:
+                return None
+            b = r.json()
             return b if (b and b.get("id")) else None
         except Exception:
             return None
 
-    with ThreadPoolExecutor(max_workers=30) as ex:
+    with ThreadPoolExecutor(max_workers=40) as ex:
         futures = {ex.submit(fetch, bid): bid for bid in range(51, 979)}
         for fut in as_completed(futures):
             b = fut.result()
             if b:
+                # Pas de filtre syndic — l'API est déjà scopée au compte Homeland
+                # On garde tous les bâtiments avec status "client" ou actifs
                 status = str(b.get("status") or "").lower()
-                # Accepter status=client, ou si status vide on garde aussi
-                if status in ("client", "") and b.get("id"):
+                if status == "client" and b.get("id"):
                     s = _building_summary(b)
                     if s:
                         found.append(s)
@@ -446,8 +453,8 @@ def _run_id_scan(cfg):
 
 def _scan_homeland_buildings(cfg):
     """
-    Stratégie 1 : POST /building/search avec divers critères.
-    Stratégie 2 : scan parallèle IDs en background + retour cache immédiat.
+    Lance le scan ID 51–978 en background au premier appel.
+    Retourne le cache immédiatement (vide si scan pas encore terminé).
     Cache 24h.
     """
     global _scan_thread_running
@@ -457,41 +464,14 @@ def _scan_homeland_buildings(cfg):
     if _buildings_cache["data"] is not None and now < _buildings_cache["expires"]:
         return _buildings_cache["data"]
 
-    found = []
-
-    # ── Stratégie 1 : essayer plusieurs critères (l'API exige au moins 1) ──
-    for criteria in [
-        {"status": "client"},
-        {"name": " "},
-        {"name": ""},
-        {"city": "Paris"},
-    ]:
-        print(f"  🔍 /building/search {criteria}…")
-        raw = _search_paged(cfg, criteria)
-        if raw:
-            print(f"  → {len(raw)} résultats avec {criteria}")
-            for b in raw:
-                s = _building_summary(b)
-                if s and not any(x["id"] == s["id"] for x in found):
-                    found.append(s)
-            break   # premier critère qui fonctionne suffit
-
-    if found:
-        found.sort(key=lambda x: x["id"])
-        print(f"  ✅ {len(found)} bâtiments via search")
-        _buildings_cache["data"]    = found
-        _buildings_cache["expires"] = now + timedelta(hours=24)
-        return found
-
-    # ── Stratégie 2 : scan ID en background, retour immédiat ──
+    # Lancer le scan en background si pas déjà en cours
     if not _scan_thread_running:
         _scan_thread_running = True
         import threading
         t = threading.Thread(target=_run_id_scan, args=(cfg,), daemon=True)
         t.start()
-        print("  🔄 Scan background lancé")
+        print("  🔄 Scan background lancé (IDs 51–978, 40 workers)")
 
-    # Retourner ce qu'on a en cache (vide si premier appel)
     return _buildings_cache["data"] or []
 
 @app.route("/api/buildings")
