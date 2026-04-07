@@ -815,8 +815,29 @@ def get_building_data(bid):
         b      = hbo(cfg, f"/building/{bid}") or {}
         b_name = b.get("name", "")
 
-        manager_id    = b.get("referentAdminUserId") or b.get("referent_admin_user_id")
-        accountant_id = b.get("accountantAdminUserId") or b.get("accountant_admin_user_id")
+        # Log tous les champs du bâtiment pour diagnostiquer gestionnaire/comptable
+        print(f"  🏢 Building {bid} keys: {list(b.keys())}")
+        for k, v in b.items():
+            if any(w in k.lower() for w in ["user", "admin", "gest", "compt", "referent", "manager", "account", "responsable"]):
+                print(f"    → {k}: {v}")
+
+        # Essai exhaustif des noms de champs possibles pour gestionnaire et comptable
+        manager_id = (
+            b.get("referentAdminUserId") or b.get("referent_admin_user_id") or
+            b.get("managerId") or b.get("manager_id") or
+            b.get("gestionnaire_id") or b.get("gestionnaireId") or
+            b.get("responsableId") or b.get("responsable_id") or
+            (b.get("manager") or {}).get("id") if isinstance(b.get("manager"), dict) else None or
+            (b.get("gestionnaire") or {}).get("id") if isinstance(b.get("gestionnaire"), dict) else None
+        )
+        accountant_id = (
+            b.get("accountantAdminUserId") or b.get("accountant_admin_user_id") or
+            b.get("accountantId") or b.get("accountant_id") or
+            b.get("comptable_id") or b.get("comptableId") or
+            (b.get("accountant") or {}).get("id") if isinstance(b.get("accountant"), dict) else None or
+            (b.get("comptable") or {}).get("id") if isinstance(b.get("comptable"), dict) else None
+        )
+        print(f"  👤 manager_id={manager_id}, accountant_id={accountant_id}")
 
         def admin_user_name(user_id):
             if not user_id: return ""
@@ -845,21 +866,44 @@ def get_building_data(bid):
             works     = f_works.result()
             projs     = f_projs.result() or to_projects_list(works)
             assembs   = f_assembs.result()
-            visits    = f_visits.result()
             incs      = f_incs.result()
             all_calls = f_calls.result()
             front_data= f_front.result()   # {"convs": [...], "csat": {...}}
             admin_map = f_admins.result()
 
-        # Fallback noms
+        # Fallback noms gestionnaire/comptable — essai exhaustif des champs possibles
+        def _extract_name(obj):
+            """Extrait un nom depuis un objet ou une string."""
+            if not obj: return ""
+            if isinstance(obj, str): return obj.strip()
+            if isinstance(obj, dict):
+                # Essayer prénom + nom
+                fn = obj.get("firstname") or obj.get("firstName") or obj.get("first_name") or ""
+                ln = obj.get("name") or obj.get("lastName") or obj.get("last_name") or obj.get("surname") or ""
+                full = f"{fn} {ln}".strip()
+                if full: return full
+                # Fallback sur fullName / displayName / email
+                return (obj.get("fullName") or obj.get("full_name") or obj.get("displayName")
+                        or obj.get("display_name") or obj.get("email") or "")
+            return ""
+
         if not manager_name:
-            mf = b.get("manager") or b.get("gestionnaire") or {}
-            manager_name = ((mf.get("firstName","")+" "+mf.get("name","")).strip()
-                            if isinstance(mf, dict) else str(mf))
+            # Chercher dans plusieurs champs possibles
+            for field in ["manager", "gestionnaire", "responsable", "referent",
+                          "referentAdminUser", "referent_admin_user"]:
+                val = b.get(field)
+                if val:
+                    manager_name = _extract_name(val)
+                    if manager_name: break
+
         if not accountant_name:
-            af = b.get("accountant") or b.get("comptable") or {}
-            accountant_name = ((af.get("firstName","")+" "+af.get("name","")).strip()
-                               if isinstance(af, dict) else str(af))
+            for field in ["accountant", "comptable", "accountantAdminUser", "accountant_admin_user"]:
+                val = b.get(field)
+                if val:
+                    accountant_name = _extract_name(val)
+                    if accountant_name: break
+
+        print(f"  👤 manager='{manager_name}', accountant='{accountant_name}'")
 
         created_at = (b.get("createdAt") or b.get("created_at") or
                       b.get("managedSince") or b.get("dateCreation") or "")
@@ -889,7 +933,7 @@ def get_building_data(bid):
             # Emails/CSAT Front filtrés par tag du bâtiment
             "emails":    process_emails_v3(front_data.get("convs", [])),
             # Visites HBO (assemblées + visites)
-            "visits":    process_visits_v3(assembs, visits),
+            "visits":    process_visits_v3(assembs),
             "period": {
                 "start": date_start,
                 "end":   date_end,
