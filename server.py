@@ -566,17 +566,30 @@ def process_emails_v3(convs):
     }
 
 # Mapping type_id assemblée HBO → label lisible
+# Tous les types connus — les inconnus sont affichés tels quels
 ASSEMBLY_TYPE_MAP = {
-    8:  "AGO",   # Assemblée Générale Ordinaire
-    11: "AGE",   # Assemblée Générale Extraordinaire
+    1:  "Conseil syndical",
+    2:  "Visite",
+    3:  "Réunion",
+    4:  "Visite technique",
+    5:  "Conseil syndical",
+    6:  "Visite de l'immeuble",
+    7:  "Réunion de copropriétaires",
+    8:  "AGO",    # Assemblée Générale Ordinaire
+    9:  "Réunion préparatoire",
+    10: "Réunion",
+    11: "AGE",    # Assemblée Générale Extraordinaire
+    12: "Visite technique",
+    13: "Réunion de travail",
 }
 
 def process_assemblies_v3(raw):
     """
-    Convertit les assemblées HBO en liste de visites.
+    Convertit TOUTES les assemblées/visites HBO en liste.
     Structure HBO : meeting_date = {"date": "2024-03-21 18:00:00", ...}
-                    type_id = 8 (AGO) ou 11 (AGE)
+                    type_id = entier (8=AGO, 11=AGE, autres types possibles)
                     status  = "done" | "planned" | ...
+    Tous les type_ids sont inclus — pas de filtre.
     """
     import re as _re2
     result = []
@@ -592,12 +605,15 @@ def process_assemblies_v3(raw):
             dt = ""
 
         type_id = a.get("type_id")
-        t = ASSEMBLY_TYPE_MAP.get(type_id) or a.get("type") or "AG"
+        # Label : mapping connu → champ type HBO → "Assemblée" par défaut
+        t = (ASSEMBLY_TYPE_MAP.get(type_id)
+             or str(a.get("type") or a.get("type_name") or "").strip()
+             or "Assemblée")
 
         # Nettoyer la description HTML si présente
-        desc = a.get("description") or ""
-        desc_clean = _re2.sub(r'<[^>]+>', '', desc).strip() if desc else ""
-        name = desc_clean or f"Assemblée {t}"
+        desc = a.get("description") or a.get("title") or a.get("name") or ""
+        desc_clean = _re2.sub(r'<[^>]+>', '', str(desc)).strip() if desc else ""
+        name = desc_clean or f"{t} {dt[:4]}".strip() if dt else t
 
         result.append({
             "name":   name,
@@ -608,7 +624,7 @@ def process_assemblies_v3(raw):
     return sorted(result, key=lambda x: x["date"] or "0000", reverse=True)
 
 def process_visits_v3(assembs_raw, visits_raw=None):
-    """Assemblées HBO = visites (AGO / AGE). visits_raw ignoré (endpoint inexistant)."""
+    """Toutes les assemblées/visites HBO (tous type_ids inclus)."""
     return process_assemblies_v3(assembs_raw)
 
 # ─────────────────────────────────────────────
@@ -815,29 +831,35 @@ def get_building_data(bid):
         b      = hbo(cfg, f"/building/{bid}") or {}
         b_name = b.get("name", "")
 
-        # Log tous les champs du bâtiment pour diagnostiquer gestionnaire/comptable
+        # Log tous les champs du bâtiment
         print(f"  🏢 Building {bid} keys: {list(b.keys())}")
         for k, v in b.items():
-            if any(w in k.lower() for w in ["user", "admin", "gest", "compt", "referent", "manager", "account", "responsable"]):
+            if any(w in k.lower() for w in ["referent", "accountant", "assistant", "user", "admin", "manager"]):
                 print(f"    → {k}: {v}")
 
-        # Essai exhaustif des noms de champs possibles pour gestionnaire et comptable
+        def _field_id(obj):
+            """Extrait l'ID depuis un objet ou un entier."""
+            if not obj: return None
+            if isinstance(obj, int): return obj
+            if isinstance(obj, dict): return obj.get("id")
+            return None
+
+        # Priorité : champs confirmés par l'utilisateur (referent, accountant, assistant)
         manager_id = (
+            _field_id(b.get("referent")) or
             b.get("referentAdminUserId") or b.get("referent_admin_user_id") or
-            b.get("managerId") or b.get("manager_id") or
-            b.get("gestionnaire_id") or b.get("gestionnaireId") or
-            b.get("responsableId") or b.get("responsable_id") or
-            (b.get("manager") or {}).get("id") if isinstance(b.get("manager"), dict) else None or
-            (b.get("gestionnaire") or {}).get("id") if isinstance(b.get("gestionnaire"), dict) else None
+            b.get("managerId") or b.get("manager_id")
         )
         accountant_id = (
+            _field_id(b.get("accountant")) or
             b.get("accountantAdminUserId") or b.get("accountant_admin_user_id") or
-            b.get("accountantId") or b.get("accountant_id") or
-            b.get("comptable_id") or b.get("comptableId") or
-            (b.get("accountant") or {}).get("id") if isinstance(b.get("accountant"), dict) else None or
-            (b.get("comptable") or {}).get("id") if isinstance(b.get("comptable"), dict) else None
+            b.get("accountantId") or b.get("accountant_id")
         )
-        print(f"  👤 manager_id={manager_id}, accountant_id={accountant_id}")
+        assistant_id = (
+            _field_id(b.get("assistant")) or
+            b.get("assistantId") or b.get("assistant_id")
+        )
+        print(f"  👤 referent_id={manager_id}, accountant_id={accountant_id}, assistant_id={assistant_id}")
 
         def admin_user_name(user_id):
             if not user_id: return ""
@@ -853,6 +875,7 @@ def get_building_data(bid):
         with ThreadPoolExecutor(max_workers=12) as ex:
             f_mgr     = ex.submit(admin_user_name, manager_id)
             f_acct    = ex.submit(admin_user_name, accountant_id)
+            f_assist  = ex.submit(admin_user_name, assistant_id)
             f_works   = ex.submit(lambda: list_items(hbo(cfg, f"/building/works/{bid}")))
             f_projs   = ex.submit(fetch_projects_hbo, cfg, bid)
             f_assembs = ex.submit(lambda: list_items(hbo(cfg, "/assemblies", {"building_id": bid})))
@@ -863,6 +886,7 @@ def get_building_data(bid):
 
             manager_name    = f_mgr.result()
             accountant_name = f_acct.result()
+            assistant_name  = f_assist.result()
             works     = f_works.result()
             projs     = f_projs.result() or to_projects_list(works)
             assembs   = f_assembs.result()
@@ -887,9 +911,9 @@ def get_building_data(bid):
                         or obj.get("display_name") or obj.get("email") or "")
             return ""
 
+        # Fallbacks : si l'ID ne donnait pas de résultat, essayer le champ objet directement
         if not manager_name:
-            # Chercher dans plusieurs champs possibles
-            for field in ["manager", "gestionnaire", "responsable", "referent",
+            for field in ["referent", "manager", "gestionnaire", "responsable",
                           "referentAdminUser", "referent_admin_user"]:
                 val = b.get(field)
                 if val:
@@ -903,7 +927,14 @@ def get_building_data(bid):
                     accountant_name = _extract_name(val)
                     if accountant_name: break
 
-        print(f"  👤 manager='{manager_name}', accountant='{accountant_name}'")
+        if not assistant_name:
+            for field in ["assistant", "assistantAdminUser", "assistant_admin_user"]:
+                val = b.get(field)
+                if val:
+                    assistant_name = _extract_name(val)
+                    if assistant_name: break
+
+        print(f"  👤 manager='{manager_name}', accountant='{accountant_name}', assistant='{assistant_name}'")
 
         created_at = (b.get("createdAt") or b.get("created_at") or
                       b.get("managedSince") or b.get("dateCreation") or "")
@@ -920,6 +951,7 @@ def get_building_data(bid):
                 "lots":       lots_count,
                 "manager":    manager_name,
                 "accountant": accountant_name,
+                "assistant":  assistant_name,
                 "created_at": created_at,
             },
             # CSAT depuis les conversations Front du bâtiment

@@ -383,6 +383,10 @@ body{
       <div class="ci-l">Comptable</div>
       <div class="ci-vs" id="cov-compt">—</div>
     </div>
+    <div class="ci" id="ci-assistant" style="display:none;">
+      <div class="ci-l">Assistant(e)</div>
+      <div class="ci-vs" id="cov-assist">—</div>
+    </div>
     <div class="ci rt">
       <div class="ci-l">Lots principaux</div>
       <div class="ci-vs" id="cov-lots">—</div>
@@ -738,9 +742,13 @@ function render(data,ds,de){
   const b=data.building||{},name=b.name||'—',per=fmM(ds)+' – '+fmM(de);
   document.getElementById('cov-sdc').textContent=name;
   document.getElementById('cov-per').textContent=per;
-  // Gestionnaire & comptable
+  // Gestionnaire, comptable & assistant
   document.getElementById('cov-gest').textContent=b.manager||'—';
   document.getElementById('cov-compt').textContent=b.accountant||'—';
+  if(b.assistant){
+    document.getElementById('cov-assist').textContent=b.assistant;
+    document.getElementById('ci-assistant').style.display='';
+  }
   // Lots
   document.getElementById('cov-lots').textContent=b.lots?b.lots+' lots':'—';
   // Depuis
