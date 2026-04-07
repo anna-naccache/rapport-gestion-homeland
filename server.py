@@ -680,6 +680,81 @@ def get_building_data(bid):
         import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/probe/<int:bid>")
+def probe(bid):
+    """Sonde tous les endpoints HBO/Front/Ringover utiles pour un bâtiment."""
+    cfg = load_config()
+    out = {}
+
+    # ── HBO ──
+    hbo_paths = [
+        f"/contacts?building_id={bid}",
+        f"/contacts?building={bid}",
+        f"/coproprietary?building_id={bid}",
+        f"/coproprietary?building={bid}",
+        f"/owners?building_id={bid}",
+        f"/persons?building_id={bid}",
+        f"/building/{bid}/contacts",
+        f"/building/{bid}/owners",
+        f"/building/{bid}/coproprietary",
+        f"/visits?building_id={bid}",
+        f"/visits?building={bid}",
+        f"/building/visits/{bid}",
+        f"/building/{bid}/visits",
+        f"/building/works/{bid}",
+        f"/projects/{bid}",
+        f"/incidents?building_id={bid}",
+        f"/building/{bid}",
+    ]
+    out["hbo"] = {}
+    for path in hbo_paths:
+        try:
+            r = hbo(cfg, path)
+            if r is None:
+                out["hbo"][path] = "null/error"
+            elif isinstance(r, list):
+                out["hbo"][path] = f"list[{len(r)}] first={str(r[0])[:120] if r else '[]'}"
+            elif isinstance(r, dict):
+                items = list_items(r)
+                if items:
+                    out["hbo"][path] = f"dict items={len(items)} keys={list(r.keys())} first={str(items[0])[:120]}"
+                else:
+                    out["hbo"][path] = f"dict keys={list(r.keys())} val={str(r)[:150]}"
+        except Exception as e:
+            out["hbo"][path] = f"exception: {e}"
+
+    # ── Front tags ──
+    try:
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        r = requests.get(f"{base}/tags", headers=hdrs, timeout=15)
+        tags = r.json().get("_results", [])
+        bid_str = str(bid)
+        matching = [t for t in tags if bid_str in t.get("name","")]
+        out["front_tags"] = {
+            "total_tags": len(tags),
+            "matching_bid": matching[:5],
+            "sample_names": [t["name"] for t in tags[:10]],
+        }
+    except Exception as e:
+        out["front_tags"] = f"error: {e}"
+
+    # ── Ringover sample call ──
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        r = requests.get(f"{cfg['ringover']['base_url']}/calls",
+            headers={"Authorization": cfg["ringover"]["api_key"]},
+            params={"limit_count": 1, "limit_offset": 0,
+                    "period_start": f"{month_ago}T00:00:00",
+                    "period_end": f"{today}T23:59:59"}, timeout=15)
+        batch = r.json().get("call_list", [])
+        out["ringover_sample"] = batch[0] if batch else "no calls"
+    except Exception as e:
+        out["ringover_sample"] = f"error: {e}"
+
+    return jsonify(out)
+
 @app.route("/api/demo")
 def get_demo():
     """Données de démo réalistes."""
