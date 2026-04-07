@@ -104,7 +104,7 @@ def hbo_token(cfg):
         return _token_cache["token"]
     r = requests.post(
         f"{cfg['hbo']['base_url']}/v2/login_check",
-        json={"email": cfg["hbo"]["email"], "password": cfg["hbo"]["password"]},
+        json={"username": cfg["hbo"]["email"], "password": cfg["hbo"]["password"]},
         timeout=15
     )
     r.raise_for_status()

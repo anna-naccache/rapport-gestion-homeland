@@ -1,8 +1,0 @@
-.env
-config.json
-__pycache__/
-*.pyc
-*.pyo
-.DS_Store
-cover_exact.png
-*.log
