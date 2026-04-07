@@ -33,7 +33,7 @@ def load_config():
     # ── Variables d'environnement (Railway / Render) ──
     if os.environ.get("HBO_EMAIL"):
         cfg["hbo"] = {
-            "base_url": os.environ.get("HBO_BASE_URL", "https://hbo.homeland.immo/api"),
+            "base_url": os.environ.get("HBO_BASE_URL", "https://hbo.homeland.immo/api/v2"),
             "email":    os.environ["HBO_EMAIL"],
             "password": os.environ.get("HBO_PASSWORD", ""),
         }
@@ -103,8 +103,8 @@ def hbo_token(cfg):
     if _token_cache["token"] and now < _token_cache["expires"]:
         return _token_cache["token"]
     r = requests.post(
-        f"{cfg['hbo']['base_url']}/v2/login_check",
-        json={"username": cfg["hbo"]["email"], "password": cfg["hbo"]["password"]},
+        f"{cfg['hbo']['base_url']}/login_check",
+        json={"email": cfg["hbo"]["email"], "password": cfg["hbo"]["password"]},
         timeout=15
     )
     r.raise_for_status()
