@@ -63,8 +63,9 @@ def load_config():
 # HBO  (JWT cache 8h)
 # ─────────────────────────────────────────────
 
-_token_cache     = {"token": None, "expires": datetime.min}
-_buildings_cache = {"data": None, "expires": datetime.min}
+_token_cache      = {"token": None, "expires": datetime.min}
+_buildings_cache  = {"data": None, "expires": datetime.min}
+_admin_users_cache = {"data": None, "expires": datetime.min}
 
 BUILDINGS_CACHE_FILE = BASE_DIR / "buildings_cache.json"
 
@@ -248,10 +249,9 @@ def to_incidents_list(raw_items):
         })
     return result
 
-def get_call_service(call):
-    """Détermine le service d'un appel depuis ses tags/labels."""
+def get_call_service_from_tags(call):
+    """Fallback: détermine le service depuis les tags/labels de l'appel."""
     tags = []
-    # Ringover peut retourner des tags dans différents champs
     for field in ("tags", "labels", "team", "ivr_option", "via_number_label"):
         val = call.get(field)
         if val:
@@ -259,33 +259,76 @@ def get_call_service(call):
                 tags.extend([str(t).lower() for t in val])
             else:
                 tags.append(str(val).lower())
-    # Aussi regarder le numéro appelé / destination
-    for field in ("to_number", "called_number", "to"):
-        val = call.get(field)
-        if val: tags.append(str(val).lower())
-
     tags_str = " ".join(tags)
     for service, keywords in SERVICE_KEYWORDS.items():
         if any(kw in tags_str for kw in keywords):
             return service
-    return "autre"
+    return "support"
 
-def process_calls_v3(calls):
-    total  = len(calls)
-    in_cnt  = sum(1 for c in calls if str(c.get("type") or c.get("direction") or "in").lower() in ("in","inbound","incoming"))
-    out_cnt = total - in_cnt
-    dur_sec = [int(c.get("duration") or c.get("duration_seconds") or 0) for c in calls]
+def get_admin_users_map(cfg):
+    """Retourne dict email→service depuis HBO /admin_users. Cache 8h."""
+    global _admin_users_cache
+    now = datetime.now()
+    if _admin_users_cache["data"] is not None and now < _admin_users_cache["expires"]:
+        return _admin_users_cache["data"]
+    try:
+        data  = hbo(cfg, "/admin_users", {"itemsPerPage": 200})
+        users = list_items(data) if data else []
+        email_map = {}
+        for u in users:
+            email = (u.get("email") or "").lower().strip()
+            if not email:
+                continue
+            # Chercher le champ service dans différents noms possibles
+            service = (u.get("service") or u.get("team") or u.get("department")
+                       or u.get("role") or u.get("poste") or "")
+            email_map[email] = str(service).lower() if service else ""
+        _admin_users_cache["data"]    = email_map
+        _admin_users_cache["expires"] = now + timedelta(hours=8)
+        print(f"  ✅ Admin users map: {len(email_map)} entrées")
+        return email_map
+    except Exception as e:
+        print(f"  ⚠ Admin users map: {e}")
+        _admin_users_cache["data"]    = {}
+        _admin_users_cache["expires"] = now + timedelta(minutes=10)
+        return {}
+
+def get_service_for_call(call, admin_email_map):
+    """Service de l'appel: email interne → profil HBO → fallback tags → 'support'."""
+    user  = call.get("user") or {}
+    email = (user.get("email") or "").lower().strip()
+    if email and admin_email_map:
+        svc = admin_email_map.get(email, "")
+        if svc:
+            # Normaliser vers les services connus
+            for key, kws in SERVICE_KEYWORDS.items():
+                if any(kw in svc for kw in kws):
+                    return key
+            # Retourner brut si non reconnu
+            return svc
+    return get_call_service_from_tags(call)
+
+def process_calls_v3(calls, admin_email_map=None):
+    total    = len(calls)
+    in_cnt   = sum(1 for c in calls if str(c.get("direction") or c.get("type") or "in").lower()
+                   in ("in", "inbound", "incoming"))
+    out_cnt  = total - in_cnt
+    # incall_duration = durée réelle de conversation (sans sonnerie)
+    dur_sec  = [int(c.get("incall_duration") or c.get("duration") or c.get("duration_seconds") or 0)
+                for c in calls]
     total_sec = sum(dur_sec)
     avg_dur   = (total_sec / len(dur_sec)) if dur_sec else 0
 
-    by_month = defaultdict(int)
+    by_month   = defaultdict(int)
     by_service = defaultdict(lambda: {"count": 0, "duration_seconds": 0})
     for c in calls:
         ds = c.get("startedAt") or c.get("started_at") or c.get("date") or ""
-        if ds: by_month[ds[:7]] += 1
-        svc = get_call_service(c)
-        by_service[svc]["count"] += 1
-        by_service[svc]["duration_seconds"] += int(c.get("duration") or c.get("duration_seconds") or 0)
+        if ds:
+            by_month[ds[:7]] += 1
+        svc = get_service_for_call(c, admin_email_map or {})
+        dur = int(c.get("incall_duration") or c.get("duration") or c.get("duration_seconds") or 0)
+        by_service[svc]["count"]            += 1
+        by_service[svc]["duration_seconds"] += dur
 
     return {
         "total":                total,
@@ -296,6 +339,163 @@ def process_calls_v3(calls):
         "by_month":             dict(sorted(by_month.items())),
         "by_service":           {k: dict(v) for k, v in by_service.items()},
     }
+
+# ── Front : tag par bâtiment ──────────────────────────────────────
+
+import re as _re
+
+def find_front_tag(cfg, bid, b_name=""):
+    """Trouve le tag Front du bâtiment (format 'NOM - BID'). Regex whole-number."""
+    if not cfg.get("front"):
+        return None
+    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        r = requests.get(f"{base}/tags", headers=headers, timeout=15)
+        r.raise_for_status()
+        tags = r.json().get("_results", [])
+        # Regex: le BID apparaît comme nombre entier (pas collé à d'autres chiffres)
+        pattern = _re.compile(r'(?<!\d)' + _re.escape(str(bid)) + r'(?!\d)')
+        matching = [t for t in tags if pattern.search(t.get("name", ""))]
+        if not matching:
+            return None
+        if len(matching) == 1:
+            return matching[0]
+        # Plusieurs correspondances → préférer celle qui contient des mots du nom du bâtiment
+        if b_name:
+            words = [w.lower() for w in b_name.split() if len(w) > 3]
+            for t in matching:
+                if any(w in t["name"].lower() for w in words):
+                    return t
+        return matching[0]
+    except Exception as e:
+        print(f"  ⚠ Front find_tag({bid}): {e}")
+        return None
+
+def front_convs_for_tag(cfg, tag_id, date_start, date_end):
+    """Conversations Front pour un tag, filtrées par date (pagination arrêtée si trop vieille)."""
+    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+    headers  = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    start_ts = int(datetime.strptime(date_start, "%Y-%m-%d").timestamp())
+    end_ts   = int(datetime.strptime(date_end,   "%Y-%m-%d").timestamp())
+    convs, page_token, done = [], None, False
+    while len(convs) < 1000 and not done:
+        params = {"limit": 100}
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            r = requests.get(f"{base}/tags/{tag_id}/conversations",
+                             headers=headers, params=params, timeout=20)
+            r.raise_for_status()
+            data  = r.json()
+            items = data.get("_results", [])
+            if not items:
+                break
+            for c in items:
+                ts = c.get("created_at") or c.get("last_message_at") or 0
+                if ts and ts < start_ts:
+                    done = True   # plus vieilles que la période → stop
+                    break
+                if not ts or ts <= end_ts:
+                    convs.append(c)
+            nxt = data.get("_pagination", {}).get("next", "")
+            if not nxt or "page_token=" not in nxt:
+                break
+            page_token = nxt.split("page_token=")[-1].split("&")[0]
+        except Exception as e:
+            print(f"  ⚠ Front tag convs ({tag_id}): {e}")
+            break
+    return convs
+
+def front_csat_from_convs(convs):
+    """Extrait les scores CSAT des conversations Front (metadata.satisfaction.score)."""
+    SCORE_MAP = {
+        "amazing": 5, "great": 5, "good": 4, "neutral": 3, "bad": 2, "awful": 1,
+        "thumbs_up": 4, "thumbs_down": 2,
+        "very_good": 5, "positive": 4, "negative": 2,
+        "5": 5, "4": 4, "3": 3, "2": 2, "1": 1,
+    }
+    scores = []
+    for c in convs:
+        meta = c.get("metadata") or {}
+        sat  = meta.get("satisfaction") or {}
+        raw  = sat.get("score") or sat.get("rating")
+        if raw is None:
+            # Essayer custom_fields
+            for cf in (c.get("custom_fields") or []):
+                fname = str(cf.get("name") or "").lower()
+                if "csat" in fname or "satisfaction" in fname:
+                    raw = cf.get("value")
+                    break
+        if raw is not None:
+            if isinstance(raw, (int, float)):
+                score = float(raw)
+                if score > 5:
+                    score = round(score / 20, 1)
+                scores.append(min(max(score, 1), 5))
+            else:
+                mapped = SCORE_MAP.get(str(raw).lower().strip())
+                if mapped:
+                    scores.append(mapped)
+    if not scores:
+        return {}
+    avg  = round(sum(scores) / len(scores), 1)
+    dist = Counter(round(s) for s in scores)
+    return {
+        "score":        avg,
+        "distribution": {i: dist.get(i, 0) for i in range(1, 6)},
+        "count":        len(scores),
+    }
+
+def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
+    """Récupère conversations + CSAT Front pour un bâtiment (via son tag)."""
+    if not cfg.get("front"):
+        return {"convs": [], "csat": {}}
+    try:
+        tag = find_front_tag(cfg, bid, b_name)
+        if not tag:
+            print(f"  ⚠ Front: aucun tag trouvé pour building {bid}")
+            return {"convs": [], "csat": {}}
+        convs = front_convs_for_tag(cfg, tag["id"], date_start, date_end)
+        csat  = front_csat_from_convs(convs)
+        print(f"  ✅ Front '{tag['name']}': {len(convs)} convs, CSAT={csat.get('score')}")
+        return {"convs": convs, "csat": csat}
+    except Exception as e:
+        print(f"  ⚠ fetch_front_for_building({bid}): {e}")
+        return {"convs": [], "csat": {}}
+
+# ── HBO : projets avec détails ────────────────────────────────────
+
+def fetch_projects_hbo(cfg, bid, max_projects=50):
+    """
+    Récupère /projects/{bid} → liste d'IDs → détails /project/{pid} en parallèle.
+    Si les objets sont déjà complets (dict avec 'title'), pas de 2e appel.
+    """
+    try:
+        raw = list_items(hbo(cfg, f"/projects/{bid}", {"order": "desc"}))
+        if not raw:
+            return []
+        subset = raw[:max_projects]
+
+        def get_detail(p):
+            if isinstance(p, dict) and (p.get("title") or p.get("name")):
+                return p  # déjà complet
+            pid = p if isinstance(p, int) else (p.get("id") if isinstance(p, dict) else None)
+            if pid:
+                return hbo(cfg, f"/project/{pid}") or {}
+            return {}
+
+        results = []
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futures = [ex.submit(get_detail, p) for p in subset]
+            for fut in as_completed(futures):
+                r = fut.result()
+                if r and (r.get("id") or r.get("title")):
+                    results.append(r)
+        return results
+    except Exception as e:
+        print(f"  ⚠ fetch_projects_hbo({bid}): {e}")
+        return []
 
 def process_emails_v3(convs):
     by_month = defaultdict(int)
@@ -575,53 +775,48 @@ def get_building_data(bid):
         date_end   = de_param or now.strftime("%Y-%m-%d")
         date_start = ds_param or (now - timedelta(days=mois * 30)).strftime("%Y-%m-%d")
 
-        # HBO — infos bâtiment
-        b = hbo(cfg, f"/building/{bid}") or {}
-
-        # ── Gestionnaire et Comptable via admin_users ──
-        def admin_user_name(user_id):
-            """Retourne 'Prénom NOM' depuis /admin_users/{id}."""
-            if not user_id:
-                return ""
-            try:
-                u = hbo(cfg, f"/admin_users/{user_id}")
-                if not u:
-                    return ""
-                fname = u.get("firstname") or u.get("firstName") or u.get("first_name") or ""
-                lname = u.get("name") or u.get("lastName") or u.get("last_name") or ""
-                full  = f"{fname} {lname}".strip()
-                return full or u.get("email", "")
-            except Exception:
-                return ""
+        # HBO — infos bâtiment (synchrone, nécessaire pour b_name)
+        b      = hbo(cfg, f"/building/{bid}") or {}
+        b_name = b.get("name", "")
 
         manager_id    = b.get("referentAdminUserId") or b.get("referent_admin_user_id")
         accountant_id = b.get("accountantAdminUserId") or b.get("accountant_admin_user_id")
 
-        b_name = b.get("name", "")
+        def admin_user_name(user_id):
+            if not user_id: return ""
+            try:
+                u = hbo(cfg, f"/admin_users/{user_id}")
+                if not u: return ""
+                fname = u.get("firstname") or u.get("firstName") or u.get("first_name") or ""
+                lname = u.get("name") or u.get("lastName") or u.get("last_name") or ""
+                return f"{fname} {lname}".strip() or u.get("email", "")
+            except Exception: return ""
 
-        # Tout en parallèle : HBO + Ringover + Front
-        with ThreadPoolExecutor(max_workers=10) as ex:
+        # Tout en parallèle : HBO + Ringover + Front + admin map
+        with ThreadPoolExecutor(max_workers=12) as ex:
             f_mgr     = ex.submit(admin_user_name, manager_id)
             f_acct    = ex.submit(admin_user_name, accountant_id)
             f_works   = ex.submit(lambda: list_items(hbo(cfg, f"/building/works/{bid}")))
-            f_projs   = ex.submit(lambda: list_items(hbo(cfg, f"/projects/{bid}", {"order": "desc"})))
+            f_projs   = ex.submit(fetch_projects_hbo, cfg, bid)
             f_assembs = ex.submit(lambda: list_items(hbo(cfg, "/assemblies", {"building_id": bid})))
             f_visits  = ex.submit(lambda: list_items(hbo(cfg, "/visits",     {"building_id": bid})))
             f_incs    = ex.submit(lambda: list_items(hbo(cfg, "/incidents",  {"building_id": bid})))
-            f_calls   = ex.submit(ringover_calls, cfg, date_start, date_end, b_name)
-            f_emails  = ex.submit(front_convs,    cfg, date_start, date_end)
+            f_calls   = ex.submit(ringover_calls, cfg, date_start, date_end)
+            f_front   = ex.submit(fetch_front_for_building, cfg, bid, b_name, date_start, date_end)
+            f_admins  = ex.submit(get_admin_users_map, cfg)
 
             manager_name    = f_mgr.result()
             accountant_name = f_acct.result()
-            works   = f_works.result()
-            projs   = f_projs.result() if not works else works
-            assembs = f_assembs.result()
-            visits  = f_visits.result()
-            incs    = f_incs.result()
-            all_calls  = f_calls.result()
-            all_emails = f_emails.result()
+            works     = f_works.result()
+            projs     = f_projs.result() or to_projects_list(works)
+            assembs   = f_assembs.result()
+            visits    = f_visits.result()
+            incs      = f_incs.result()
+            all_calls = f_calls.result()
+            front_data= f_front.result()   # {"convs": [...], "csat": {...}}
+            admin_map = f_admins.result()
 
-        # Fallback noms si admin_users vide
+        # Fallback noms
         if not manager_name:
             mf = b.get("manager") or b.get("gestionnaire") or {}
             manager_name = ((mf.get("firstName","")+" "+mf.get("name","")).strip()
@@ -631,27 +826,12 @@ def get_building_data(bid):
             accountant_name = ((af.get("firstName","")+" "+af.get("name","")).strip()
                                if isinstance(af, dict) else str(af))
 
-        # Date de création / début de gestion
         created_at = (b.get("createdAt") or b.get("created_at") or
                       b.get("managedSince") or b.get("dateCreation") or "")
         if created_at: created_at = created_at[:10]
 
-        # Lots
         lots_count = (b.get("lots") or b.get("lotsCount") or b.get("lotsPrincipaux")
                       or b.get("numberOfLots") or b.get("nb_lots") or 0)
-
-        # Filtrer par bâtiment si possible
-        bcalls  = ([c for c in all_calls if str(c.get("building_id","")) == str(bid)]
-                   or all_calls)
-        bemails = ([e for e in all_emails if str(e.get("building_id","")) == str(bid)
-                    or b_name[:6].lower() in str(e.get("subject","")).lower()]
-                   or all_emails)
-
-        # Satisfaction
-        sat_raw = {
-            "score": b.get("satisfactionScore") or b.get("satisfaction"),
-            "notes": b.get("satisfactionNotes") or [],
-        }
 
         result = {
             "building": {
@@ -663,12 +843,18 @@ def get_building_data(bid):
                 "accountant": accountant_name,
                 "created_at": created_at,
             },
-            "csat":       satisfaction_to_v3(sat_raw),
-            "projects":   to_projects_list(projs),
-            "incidents":  to_incidents_list(incs),
-            "calls":      process_calls_v3(bcalls),
-            "emails":     process_emails_v3(bemails),
-            "visits":     process_visits_v3(assembs, visits),
+            # CSAT depuis les conversations Front du bâtiment
+            "csat":      front_data.get("csat", {}),
+            # Projets depuis HBO /projects/{bid} + détails
+            "projects":  to_projects_list(projs),
+            # Incidents depuis HBO /incidents?building_id={bid}
+            "incidents": to_incidents_list(incs),
+            # Appels Ringover : service déduit via email interne → profil HBO
+            "calls":     process_calls_v3(all_calls, admin_map),
+            # Emails/CSAT Front filtrés par tag du bâtiment
+            "emails":    process_emails_v3(front_data.get("convs", [])),
+            # Visites HBO (assemblées + visites)
+            "visits":    process_visits_v3(assembs, visits),
             "period": {
                 "start": date_start,
                 "end":   date_end,
@@ -679,81 +865,6 @@ def get_building_data(bid):
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
-@app.route("/api/probe/<int:bid>")
-def probe(bid):
-    """Sonde tous les endpoints HBO/Front/Ringover utiles pour un bâtiment."""
-    cfg = load_config()
-    out = {}
-
-    # ── HBO ──
-    hbo_paths = [
-        f"/contacts?building_id={bid}",
-        f"/contacts?building={bid}",
-        f"/coproprietary?building_id={bid}",
-        f"/coproprietary?building={bid}",
-        f"/owners?building_id={bid}",
-        f"/persons?building_id={bid}",
-        f"/building/{bid}/contacts",
-        f"/building/{bid}/owners",
-        f"/building/{bid}/coproprietary",
-        f"/visits?building_id={bid}",
-        f"/visits?building={bid}",
-        f"/building/visits/{bid}",
-        f"/building/{bid}/visits",
-        f"/building/works/{bid}",
-        f"/projects/{bid}",
-        f"/incidents?building_id={bid}",
-        f"/building/{bid}",
-    ]
-    out["hbo"] = {}
-    for path in hbo_paths:
-        try:
-            r = hbo(cfg, path)
-            if r is None:
-                out["hbo"][path] = "null/error"
-            elif isinstance(r, list):
-                out["hbo"][path] = f"list[{len(r)}] first={str(r[0])[:120] if r else '[]'}"
-            elif isinstance(r, dict):
-                items = list_items(r)
-                if items:
-                    out["hbo"][path] = f"dict items={len(items)} keys={list(r.keys())} first={str(items[0])[:120]}"
-                else:
-                    out["hbo"][path] = f"dict keys={list(r.keys())} val={str(r)[:150]}"
-        except Exception as e:
-            out["hbo"][path] = f"exception: {e}"
-
-    # ── Front tags ──
-    try:
-        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
-        hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        r = requests.get(f"{base}/tags", headers=hdrs, timeout=15)
-        tags = r.json().get("_results", [])
-        bid_str = str(bid)
-        matching = [t for t in tags if bid_str in t.get("name","")]
-        out["front_tags"] = {
-            "total_tags": len(tags),
-            "matching_bid": matching[:5],
-            "sample_names": [t["name"] for t in tags[:10]],
-        }
-    except Exception as e:
-        out["front_tags"] = f"error: {e}"
-
-    # ── Ringover sample call ──
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        r = requests.get(f"{cfg['ringover']['base_url']}/calls",
-            headers={"Authorization": cfg["ringover"]["api_key"]},
-            params={"limit_count": 1, "limit_offset": 0,
-                    "period_start": f"{month_ago}T00:00:00",
-                    "period_end": f"{today}T23:59:59"}, timeout=15)
-        batch = r.json().get("call_list", [])
-        out["ringover_sample"] = batch[0] if batch else "no calls"
-    except Exception as e:
-        out["ringover_sample"] = f"error: {e}"
-
-    return jsonify(out)
 
 @app.route("/api/demo")
 def get_demo():
