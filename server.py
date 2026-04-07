@@ -565,55 +565,51 @@ def process_emails_v3(convs):
         "by_month":       dict(sorted(by_month.items())),
     }
 
+# Mapping type_id assemblée HBO → label lisible
+ASSEMBLY_TYPE_MAP = {
+    8:  "AGO",   # Assemblée Générale Ordinaire
+    11: "AGE",   # Assemblée Générale Extraordinaire
+}
+
 def process_assemblies_v3(raw):
+    """
+    Convertit les assemblées HBO en liste de visites.
+    Structure HBO : meeting_date = {"date": "2024-03-21 18:00:00", ...}
+                    type_id = 8 (AGO) ou 11 (AGE)
+                    status  = "done" | "planned" | ...
+    """
+    import re as _re2
     result = []
     for a in raw:
-        dt = a.get("date") or a.get("scheduledAt") or a.get("heldAt") or ""
-        tp = a.get("type", {})
-        t  = (tp.get("name") or tp.get("label") if isinstance(tp, dict) else str(tp)) or "AG"
+        # Extraire la date depuis l'objet imbriqué HBO
+        md = a.get("meeting_date")
+        if isinstance(md, dict):
+            dt = (md.get("date") or "")[:10]
+        else:
+            dt = str(md or "")[:10]
+        # Ignorer les dates epoch invalides
+        if dt == "1970-01-01":
+            dt = ""
+
+        type_id = a.get("type_id")
+        t = ASSEMBLY_TYPE_MAP.get(type_id) or a.get("type") or "AG"
+
+        # Nettoyer la description HTML si présente
+        desc = a.get("description") or ""
+        desc_clean = _re2.sub(r'<[^>]+>', '', desc).strip() if desc else ""
+        name = desc_clean or f"Assemblée {t}"
+
         result.append({
-            "name":   a.get("name") or a.get("title") or f"Assemblée {t}",
+            "name":   name,
             "type":   t,
-            "date":   dt[:10] if dt else "",
-            "status": "Tenu" if is_closed(a) else "Planifié",
+            "date":   dt,
+            "status": "Tenu" if a.get("status") == "done" else "Planifié",
         })
-    return sorted(result, key=lambda x: x["date"], reverse=True)
+    return sorted(result, key=lambda x: x["date"] or "0000", reverse=True)
 
 def process_visits_v3(assembs_raw, visits_raw=None):
-    """Combine assemblées et visites en une seule liste."""
-    result = process_assemblies_v3(assembs_raw)
-    if visits_raw:
-        for v in visits_raw:
-            dt = v.get("date") or v.get("scheduledAt") or v.get("visitedAt") or ""
-            tp = v.get("type", {})
-            t  = (tp.get("name") or tp.get("label") if isinstance(tp, dict) else str(tp)) or "Visite"
-            result.append({
-                "name":   v.get("name") or v.get("title") or f"Visite {t}",
-                "type":   t,
-                "date":   dt[:10] if dt else "",
-                "status": "Effectuée" if is_closed(v) else "Planifiée",
-            })
-    return sorted(result, key=lambda x: x["date"], reverse=True)
-
-def satisfaction_to_v3(sat):
-    """Convertit la satisfaction HBO en format CSAT attendu par le HTML."""
-    if not sat: return {}
-    score = sat.get("score") or sat.get("satisfactionScore")
-    notes = sat.get("notes") or sat.get("satisfactionNotes") or []
-
-    # Si notes est une liste de scores individuels, calculer la distribution
-    if notes and isinstance(notes[0], (int, float)):
-        dist = Counter(int(n) for n in notes if 1 <= n <= 5)
-        distribution = {i: dist.get(i, 0) for i in range(1, 6)}
-    else:
-        distribution = {}
-
-    # Convertir score sur 5 si c'est sur 100
-    if score:
-        score = float(score)
-        if score > 5: score = round(score / 20, 1)
-
-    return {"score": score, "distribution": distribution}
+    """Assemblées HBO = visites (AGO / AGE). visits_raw ignoré (endpoint inexistant)."""
+    return process_assemblies_v3(assembs_raw)
 
 # ─────────────────────────────────────────────
 # ROUTES
@@ -839,7 +835,6 @@ def get_building_data(bid):
             f_works   = ex.submit(lambda: list_items(hbo(cfg, f"/building/works/{bid}")))
             f_projs   = ex.submit(fetch_projects_hbo, cfg, bid)
             f_assembs = ex.submit(lambda: list_items(hbo(cfg, "/assemblies", {"building_id": bid})))
-            f_visits  = ex.submit(lambda: list_items(hbo(cfg, "/visits",     {"building_id": bid})))
             f_incs    = ex.submit(lambda: list_items(hbo(cfg, "/incidents",  {"building_id": bid})))
             f_calls   = ex.submit(ringover_calls, cfg, date_start, date_end)
             f_front   = ex.submit(fetch_front_for_building, cfg, bid, b_name, date_start, date_end)
