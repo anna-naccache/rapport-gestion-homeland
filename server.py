@@ -201,6 +201,15 @@ CATEGORY_KEYWORDS = {
 }
 CLOSED_WORDS = {"closed","terminé","termine","done","completed","clos","archivé","archive","resolved"}
 
+# Mapping direct des types HBO → catégories rapport
+HBO_TYPE_MAP = {
+    "gestion":  "GESTION",
+    "travaux":  "TRAVAUX",
+    "litige":   "LITIGES",
+    "mutation": "MUTATIONS",
+    "sinistre": "SINISTRES",
+}
+
 # Mots-clés pour identifier le service depuis les tags/labels Ringover
 SERVICE_KEYWORDS = {
     "gestion":       ["gestion", "gestionnaire", "copro", "copropriété"],
@@ -220,19 +229,25 @@ def categorize(p):
     return "GESTION"
 
 def is_closed(p):
+    # HBO projects: status == "inactif" → clôturé
+    if str(p.get("status") or "").lower() == "inactif":
+        return True
     st = str(p.get("status") or p.get("state") or "").lower()
     return any(s in st for s in CLOSED_WORDS)
 
 def to_projects_list(raw_items):
-    """Convertit les projets/incidents HBO en liste plate pour le HTML."""
+    """Convertit les projets HBO en liste plate pour le HTML."""
     result = []
     for p in raw_items:
-        cat = p.get("category") or categorize(p)
+        # Utiliser le champ `type` HBO directement (gestion/travaux/litige/mutation/sinistre)
+        hbo_type = str(p.get("type") or "").lower()
+        cat = HBO_TYPE_MAP.get(hbo_type) or p.get("category") or categorize(p)
+        closed = is_closed(p)
         result.append({
-            "name":       p.get("title") or p.get("name") or p.get("subject") or "—",
+            "name":       p.get("description") or p.get("title") or p.get("name") or p.get("subject") or "—",
             "category":   cat,
-            "status":     "Clôturé" if is_closed(p) else "En cours",
-            "start_date": (p.get("createdAt") or p.get("startDate") or "")[:10],
+            "status":     "Clôturé" if closed else "En cours",
+            "start_date": (p.get("start_date") or p.get("createdAt") or p.get("startDate") or "")[:10],
         })
     return result
 
@@ -464,34 +479,59 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
         print(f"  ⚠ fetch_front_for_building({bid}): {e}")
         return {"convs": [], "csat": {}}
 
-# ── HBO : projets avec détails ────────────────────────────────────
+# ── HBO : projets avec détails + cache 1h par bâtiment ───────────
 
-def fetch_projects_hbo(cfg, bid, max_projects=50):
+_projects_cache = {}   # {bid: {"data": [...], "expires": datetime}}
+
+def fetch_projects_hbo(cfg, bid, max_workers=40):
     """
-    Récupère /projects/{bid} → liste d'IDs → détails /project/{pid} en parallèle.
-    Si les objets sont déjà complets (dict avec 'title'), pas de 2e appel.
+    Récupère TOUS les projets HBO d'un bâtiment :
+      /projects/{bid} → liste d'IDs → /project/{pid} en parallèle (40 workers).
+    Cache 1h par bâtiment pour éviter de rescanner à chaque rapport.
     """
+    global _projects_cache
+    now = datetime.now()
+
+    # Cache valide ?
+    cached = _projects_cache.get(bid)
+    if cached and now < cached["expires"]:
+        return cached["data"]
+
     try:
-        raw = list_items(hbo(cfg, f"/projects/{bid}", {"order": "desc"}))
+        raw = list_items(hbo(cfg, f"/projects/{bid}"))
         if not raw:
             return []
-        subset = raw[:max_projects]
 
-        def get_detail(p):
-            if isinstance(p, dict) and (p.get("title") or p.get("name")):
-                return p  # déjà complet
-            pid = p if isinstance(p, int) else (p.get("id") if isinstance(p, dict) else None)
-            if pid:
-                return hbo(cfg, f"/project/{pid}") or {}
-            return {}
+        # Normaliser en liste d'entiers
+        ids = []
+        for p in raw:
+            if isinstance(p, int):
+                ids.append(p)
+            elif isinstance(p, dict) and p.get("id"):
+                ids.append(int(p["id"]))
+
+        print(f"  🔍 Projets {bid}: {len(ids)} IDs à récupérer…")
+
+        def get_detail(pid):
+            try:
+                r = hbo(cfg, f"/project/{pid}")
+                return r if (r and r.get("id")) else None
+            except Exception:
+                return None
 
         results = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            futures = [ex.submit(get_detail, p) for p in subset]
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(get_detail, pid): pid for pid in ids}
             for fut in as_completed(futures):
                 r = fut.result()
-                if r and (r.get("id") or r.get("title")):
+                if r:
                     results.append(r)
+
+        actifs   = sum(1 for p in results if p.get("status") != "inactif")
+        inactifs = len(results) - actifs
+        print(f"  ✅ Projets {bid}: {actifs} actifs / {inactifs} inactifs")
+
+        _projects_cache[bid] = {"data": results, "expires": now + timedelta(hours=1)}
         return results
     except Exception as e:
         print(f"  ⚠ fetch_projects_hbo({bid}): {e}")
