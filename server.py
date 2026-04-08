@@ -305,9 +305,10 @@ def to_projects_list(raw_items, date_start=None, date_end=None):
         # ── Filtrage par période du rapport ────────────────────────────
         if date_start and date_end:
             if closed:
-                # Clôturé : inclus seulement si end_date dans la période
-                # (si end_date vide → inclus, pas assez d'info pour exclure)
-                if end_date and (end_date < date_start or end_date > date_end):
+                # Clôturé : filtrer par end_date si disponible, sinon par start_date.
+                # Si les deux sont vides, on inclut par défaut.
+                ref_date = end_date or start_date
+                if ref_date and (ref_date < date_start or ref_date > date_end):
                     continue
             # Actif : aucun filtre de date → tous les projets actifs sont inclus
 
@@ -807,13 +808,14 @@ def process_visits_v3(events_raw, admin_id_map=None, date_start=None, date_end=N
       - added_by      → id admin → résolu en 'Prénom Nom' (colonne 3)
 
     Fallback si meeting_type/event_date absent : utilise les champs /assemblies
-    (meeting_date, type_id) pour compatibilité avec l'ancien endpoint.
+    (date, type) pour compatibilité avec l'ancien endpoint.
     """
     admin_id_map = admin_id_map or {}
     result = []
     for e in events_raw:
         # ── Date ──────────────────────────────────────────────────────
-        dt = e.get("event_date") or e.get("meeting_date") or ""
+        # Essai dans l'ordre : event_date (Buildings_events), meeting_date, date (/assemblies)
+        dt = e.get("event_date") or e.get("meeting_date") or e.get("date") or ""
         if isinstance(dt, dict):                # meeting_date = {"date": "2024-..."} (ancien format)
             dt = dt.get("date") or ""
         dt = str(dt or "")[:10]
