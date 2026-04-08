@@ -400,77 +400,41 @@ def process_calls_v3(calls, admin_email_map=None):
 import re as _re
 
 def find_front_tag(cfg, bid, b_name=""):
-    """Trouve le tag Front du bâtiment avec early-exit pagination.
-    - Si le cache global est chaud → recherche instantanée en mémoire.
-    - Sinon → pagination avec arrêt dès la première correspondance.
-    Format observé: '000632 16 RUE LEON JOST' (ID zero-paddé + adresse).
+    """Trouve le tag Front du bâtiment via le cache global (_get_all_front_tags).
+    Le cache est chargé une fois au warmup ou au premier appel (4h TTL).
+    Format: '000632 16 RUE LEON JOST' (ID zero-paddé + adresse).
     """
     if not cfg.get("front"):
         return None
 
-    bid_str    = str(bid)
-    bid_pad    = bid_str.zfill(6)   # ex: "000632"
+    bid_str = str(bid)
+    bid_pad = bid_str.zfill(6)   # ex: "000632"
     pattern_id = _re.compile(
         r'(?:^|[^0-9])(' + _re.escape(bid_pad) + r'|' + _re.escape(bid_str) + r')(?:[^0-9]|$)'
     )
     words_fb = [w.lower() for w in b_name.split() if len(w) > 3] if b_name else []
 
-    # --- Cas 1 : cache chaud → recherche immédiate ---
-    if _front_tags_cache["data"] is not None and datetime.now() < _front_tags_cache["expires"]:
-        all_tags = _front_tags_cache["data"]
-        for t in all_tags:
-            if pattern_id.search(t.get("name", "")):
-                print(f"  🏷 Front (cache): tag '{t.get('name')}'")
-                return t
-        if words_fb:
-            for t in all_tags:
-                if any(w in t.get("name","").lower() for w in words_fb):
-                    print(f"  🏷 Front (cache/nom): tag '{t.get('name')}'")
-                    return t
-        print(f"  ⚠ Front (cache): aucun tag pour building {bid}")
+    try:
+        all_tags = _get_all_front_tags(cfg)
+    except Exception as e:
+        print(f"  ⚠ Front get_all_tags({bid}): {e}", flush=True)
         return None
 
-    # --- Cas 2 : cache froid → early-exit pagination ---
-    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    try:
-        page_token, pages, fallback_candidates = None, 0, []
-        while True:
-            params = {"limit": 200}
-            if page_token:
-                params["page_token"] = page_token
-            r = requests.get(f"{base}/tags", headers=headers, params=params, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            tags = data.get("_results", [])
-            pages += 1
-
-            for t in tags:
-                name = t.get("name", "")
-                if pattern_id.search(name):
-                    print(f"  🏷 Front: tag trouvé page {pages} — '{name}'")
-                    return t   # ← early exit dès qu'on trouve
-
-            if words_fb:
-                for t in tags:
-                    if any(w in t.get("name","").lower() for w in words_fb):
-                        fallback_candidates.append(t)
-
-            nxt = data.get("_pagination", {}).get("next", "")
-            if not nxt or "page_token=" not in nxt:
-                break
-            page_token = nxt.split("page_token=")[-1].split("&")[0]
-
-        if fallback_candidates:
-            t = fallback_candidates[0]
-            print(f"  🏷 Front (fallback nom): tag '{t.get('name')}'")
+    # Chercher par ID (format zero-paddé prioritaire)
+    for t in all_tags:
+        if pattern_id.search(t.get("name", "")):
+            print(f"  🏷 Front: tag '{t.get('name')}' (building {bid})", flush=True)
             return t
 
-        print(f"  ⚠ Front: aucun tag pour building {bid} après {pages} pages")
-        return None
-    except Exception as e:
-        print(f"  ⚠ Front find_tag({bid}): {e}")
-        return None
+    # Fallback : correspondance par mots du nom de bâtiment
+    if words_fb:
+        for t in all_tags:
+            if any(w in t.get("name","").lower() for w in words_fb):
+                print(f"  🏷 Front (nom): tag '{t.get('name')}' (building {bid})", flush=True)
+                return t
+
+    print(f"  ⚠ Front: aucun tag pour building {bid} (b_name={b_name!r})", flush=True)
+    return None
 
 
 def _get_all_front_tags(cfg):
@@ -498,7 +462,7 @@ def _get_all_front_tags(cfg):
 
     _front_tags_cache["data"]    = all_tags
     _front_tags_cache["expires"] = now + timedelta(hours=4)
-    print(f"  ✅ Front tags cache: {len(all_tags)} tags chargés")
+    print(f"  ✅ Front tags cache: {len(all_tags)} tags chargés", flush=True)
     return all_tags
 
 def front_convs_for_tag(cfg, tag_id, date_start, date_end):
@@ -1287,7 +1251,7 @@ def debug_front_convs(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "e5d8a42"})
+    return jsonify({"status": "ok", "version": "f2c9b17"})
 
 # ─────────────────────────────────────────────
 # START
@@ -1305,12 +1269,20 @@ def _warmup():
             return
         # Cache disque déjà valide → pas besoin de rescan
         if _buildings_cache["data"] and datetime.now() < _buildings_cache["expires"]:
-            print("  ✅ Cache disque valide, pas de rescan au démarrage")
-            return
-        print("  🔥 Warmup: scan bâtiments au démarrage…")
-        _run_id_scan(cfg)
+            print("  ✅ Cache disque valide, pas de rescan au démarrage", flush=True)
+        else:
+            print("  🔥 Warmup: scan bâtiments au démarrage…", flush=True)
+            _run_id_scan(cfg)
+        # Pre-warm Front tags cache (évite les 200s de pagination à la première requête)
+        if cfg.get("front"):
+            print("  🔥 Warmup: chargement tags Front (cache 4h)…", flush=True)
+            try:
+                tags = _get_all_front_tags(cfg)
+                print(f"  ✅ {len(tags)} tags Front en cache", flush=True)
+            except Exception as fe:
+                print(f"  ⚠ Front tags warmup: {fe}", flush=True)
     except Exception as e:
-        print(f"  ⚠ Warmup error: {e}")
+        print(f"  ⚠ Warmup error: {e}", flush=True)
 
 import threading as _threading
 _threading.Thread(target=_warmup, daemon=True).start()
