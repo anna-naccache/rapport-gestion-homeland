@@ -285,7 +285,7 @@ def to_projects_list(raw_items):
         result.append({
             "name":       p.get("description") or p.get("title") or p.get("name") or p.get("subject") or "—",
             "category":   cat,
-            "status":     "Clôturé" if closed else "En cours",
+            "status":     "Clos" if closed else "En cours",
             "start_date": (p.get("start_date") or p.get("createdAt") or p.get("startDate") or "")[:10],
         })
     return result
@@ -298,7 +298,7 @@ def to_incidents_list(raw_items):
         result.append({
             "name":     i.get("title") or i.get("name") or i.get("subject") or "—",
             "category": cat,
-            "status":   "Clôturé" if is_closed(i) else "En cours",
+            "status":   "Clos" if is_closed(i) else "En cours",
             "date":     (i.get("createdAt") or i.get("date") or "")[:10],
         })
     return result
@@ -1051,22 +1051,22 @@ def get_demo():
         "projects": [
             {"name": "Ravalement de façade",               "category": "TRAVAUX",   "status": "En cours",  "start_date": "2024-03-01"},
             {"name": "Remplacement chaudière collective",   "category": "TRAVAUX",   "status": "En cours",  "start_date": "2024-06-15"},
-            {"name": "Audit énergétique DPE collectif",     "category": "GESTION",   "status": "Clôturé",   "start_date": "2023-11-01"},
-            {"name": "Mise en conformité cage d'escalier",  "category": "TRAVAUX",   "status": "Clôturé",   "start_date": "2023-09-01"},
-            {"name": "Installation boîtes aux lettres",     "category": "GESTION",   "status": "Clôturé",   "start_date": "2024-01-10"},
+            {"name": "Audit énergétique DPE collectif",     "category": "GESTION",   "status": "Clos",   "start_date": "2023-11-01"},
+            {"name": "Mise en conformité cage d'escalier",  "category": "TRAVAUX",   "status": "Clos",   "start_date": "2023-09-01"},
+            {"name": "Installation boîtes aux lettres",     "category": "GESTION",   "status": "Clos",   "start_date": "2024-01-10"},
             {"name": "Litige étanchéité terrasse lot 12",   "category": "LITIGES",   "status": "En cours",  "start_date": "2024-04-01"},
         ],
         "incidents": [
-            {"name": "Dégât des eaux appartement 3B",        "category": "SINISTRES",  "status": "Clôturé", "date": "2024-02-14"},
+            {"name": "Dégât des eaux appartement 3B",        "category": "SINISTRES",  "status": "Clos", "date": "2024-02-14"},
             {"name": "Infiltration toiture — cage B",         "category": "SINISTRES",  "status": "En cours","date": "2024-08-05"},
             {"name": "Fissures parking sous-sol",             "category": "SINISTRES",  "status": "En cours","date": "2024-09-22"},
             {"name": "Ravalement de façade côté boulevard",   "category": "TRAVAUX",    "status": "En cours","date": "2024-03-01"},
-            {"name": "Remplacement canalisations eaux usées", "category": "TRAVAUX",    "status": "Clôturé", "date": "2023-12-10"},
-            {"name": "Mutation lot 7 — acte signé",           "category": "MUTATIONS",  "status": "Clôturé", "date": "2024-05-30"},
+            {"name": "Remplacement canalisations eaux usées", "category": "TRAVAUX",    "status": "Clos", "date": "2023-12-10"},
+            {"name": "Mutation lot 7 — acte signé",           "category": "MUTATIONS",  "status": "Clos", "date": "2024-05-30"},
             {"name": "Mutation lot 19 — en cours",            "category": "MUTATIONS",  "status": "En cours","date": "2024-11-03"},
             {"name": "Contentieux charges impayées lot 24",   "category": "LITIGES",    "status": "En cours","date": "2024-04-15"},
-            {"name": "Réparation portail électrique",         "category": "GESTION",    "status": "Clôturé", "date": "2024-07-08"},
-            {"name": "Remplacement visiophone",               "category": "GESTION",    "status": "Clôturé", "date": "2024-09-14"},
+            {"name": "Réparation portail électrique",         "category": "GESTION",    "status": "Clos", "date": "2024-07-08"},
+            {"name": "Remplacement visiophone",               "category": "GESTION",    "status": "Clos", "date": "2024-09-14"},
         ],
         "emails": {
             "total": 387, "sent": 205, "received": 182,
@@ -1192,9 +1192,42 @@ def debug_admin_user(uid):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/debug/front_convs/<int:bid>")
+def debug_front_convs(bid):
+    """Retourne les 3 premières conversations Front d'un bâtiment pour diagnostiquer CSAT."""
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        b = hbo(cfg, f"/building/{bid}") or {}
+        b_name = b.get("name","")
+        tag = find_front_tag(cfg, bid, b_name)
+        if not tag:
+            return jsonify({"error": f"Aucun tag Front pour building {bid}", "building_name": b_name})
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        r = requests.get(f"{base}/tags/{tag['id']}/conversations", headers=headers,
+                         params={"limit": 3}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        convs = data.get("_results", [])
+        # Montrer tous les champs metadata/satisfaction pour comprendre CSAT
+        samples = []
+        for c in convs:
+            samples.append({
+                "id": c.get("id"),
+                "subject": c.get("subject","")[:60],
+                "metadata": c.get("metadata"),
+                "custom_fields": c.get("custom_fields"),
+                "all_keys": list(c.keys()),
+            })
+        return jsonify({"tag": tag["name"], "total_convs_page": len(convs), "samples": samples})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "d3f7a91"})
+    return jsonify({"status": "ok", "version": "a8c2e14"})
 
 # ─────────────────────────────────────────────
 # START

@@ -731,7 +731,7 @@ async function go(){
 function fmM(s){if(!s)return'—';const[y,m]=s.split('-');return['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'][+m-1]+' '+y;}
 function pill(l,c){return`<span class="pill ${c}">${l}</span>`;}
 function catP(c){if(!c)return pill('—','p-gr');const mp={SINISTRES:'p-r',TRAVAUX:'p-g',GESTION:'p-b',LITIGES:'p-o',MUTATIONS:'p-pu'};return pill(c,mp[c.toUpperCase()]||'p-gr');}
-function stP(s){if(!s)return pill('—','p-gr');const lo=s.toLowerCase();if(/cours|ouvert|progress/.test(lo))return pill(s,'p-o');if(/clos|termin|resolv/.test(lo))return pill(s,'p-g');return pill(s,'p-gr');}
+function stP(s){if(!s)return pill('—','p-gr');const lo=s.toLowerCase();if(/cours|ouvert|progress/.test(lo))return pill(s,'p-o');if(/clos|termin|resolv|clôt/.test(lo))return pill(s,'p-g');return pill(s,'p-gr');}
 function mkT(hs,rows){
   if(!rows.length)return'<div class="empty">Aucune donnée sur la période</div>';
   return`<table class="tbl"><thead><tr>${hs.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>`;
@@ -795,7 +795,7 @@ function rCSAT(data){
 
 function rProj(data){
   const ps=data.projects||[];
-  const isClos=s=>/termin|clos|resolv/i.test(s||'');
+  const isClos=s=>/termin|clos|clôt|resolv/i.test(s||'');
   const ec=ps.filter(p=>!isClos(p.status)),te=ps.filter(p=>isClos(p.status));
   // Regrouper par catégorie
   const byCat={};
@@ -859,8 +859,19 @@ function rAppels(data){
 }
 
 function rVisits(data){
-  const visits=data.visits||data.assemblies||[],w=document.getElementById('ag-w');
-  if(!visits.length){w.innerHTML='<div class="empty">Aucune visite sur la période</div>';return;}
+  const all=data.visits||data.assemblies||[],w=document.getElementById('ag-w');
+  // Filtrer sur la période du rapport
+  const p=data.period||{},ds=p.start||'',de=p.end||'';
+  const visits=all.filter(a=>{
+    if(!a.date)return true;
+    if(ds&&a.date<ds)return false;
+    if(de&&a.date>de)return false;
+    return true;
+  });
+  if(!visits.length){
+    w.innerHTML='<div class="empty">Aucune visite / assemblée sur la période'+(all.length?` (${all.length} hors période)`:'')+'</div>';
+    return;
+  }
   w.innerHTML=mkT(['Visite / Assemblée','Type','Date','Statut'],visits.map(a=>`<tr>
     <td>${a.name||'Visite'}</td><td>${pill(a.type||'Visite','p-b')}</td>
     <td style="font-size:11px;">${a.date?new Date(a.date).toLocaleDateString('fr-FR'):'—'}</td>
@@ -869,7 +880,7 @@ function rVisits(data){
 
 function rSin(data){
   const all=data.incidents||[],sin=all.filter(i=>/sinistre/i.test(i.category||i.type||''));
-  const ouv=sin.filter(s=>!/clos|termin/i.test(s.status||'')),cl=sin.filter(s=>/clos|termin/i.test(s.status||''));
+  const ouv=sin.filter(s=>!/clos|clôt|termin/i.test(s.status||'')),cl=sin.filter(s=>/clos|clôt|termin/i.test(s.status||''));
   const rows=sin.slice(0,6).map(s=>`<tr><td>${s.name||s.description?.slice(0,50)||'—'}</td><td>${stP(s.status)}</td></tr>`);
   document.getElementById('si-w').innerHTML=
     `<div class="kg g3"><div class="kpi"><div class="kn">${sin.length}</div><div class="kl">Total</div></div>
