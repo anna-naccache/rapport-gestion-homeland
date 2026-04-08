@@ -1282,12 +1282,35 @@ def debug_front_tags():
 
 @app.route("/api/debug/copropriete/<int:bid>")
 def debug_copropriete(bid):
-    """Retourne tous les champs bruts de la copropriété HBO (pour diagnostiquer lots)."""
+    """Sonde plusieurs variantes de chemin HBO pour trouver les données copropriété (lots)."""
     try:
         cfg = load_config()
-        co = hbo(cfg, f"/copropriete/{bid}") or {}
-        lot_fields = {k: v for k, v in co.items() if any(w in k.lower() for w in ["lot", "ppx", "copro", "principal"])}
-        return jsonify({"building_id": bid, "keys": list(co.keys()), "lot_fields": lot_fields, "data": co})
+        paths = [
+            f"/copropriete/{bid}",
+            f"/coproprietes/{bid}",
+            f"/coproprietes",
+            f"/building/{bid}/copropriete",
+            f"/syndic/copropriete/{bid}",
+        ]
+        results = {}
+        for p in paths:
+            params = {"building_id": bid} if p == "/coproprietes" else None
+            raw = hbo(cfg, p, params=params)
+            if raw is not None:
+                # Cherche les champs liés aux lots
+                data = raw if isinstance(raw, dict) else {}
+                items = list_items(raw) if isinstance(raw, (list, dict)) else []
+                lot_fields = {k: v for k, v in data.items() if any(w in k.lower() for w in ["lot", "ppx"])}
+                results[p] = {
+                    "type": type(raw).__name__,
+                    "keys": list(data.keys())[:20],
+                    "lot_fields": lot_fields,
+                    "items_count": len(items),
+                    "sample": items[:2] if items else None,
+                }
+            else:
+                results[p] = None
+        return jsonify({"building_id": bid, "paths_tried": results})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
