@@ -1163,7 +1163,7 @@ def debug_project(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "version": "fb1c5d0"})
 
 # ─────────────────────────────────────────────
 # START
