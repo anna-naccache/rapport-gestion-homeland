@@ -1161,9 +1161,40 @@ def debug_project(bid):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/debug/front_tags")
+def debug_front_tags():
+    """Liste les tags Front (pour diagnostiquer CSAT manquant)."""
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        r = requests.get(f"{base}/tags", headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        tags = data.get("_results", [])
+        return jsonify({
+            "total": len(tags),
+            "sample": [{"id": t.get("id"), "name": t.get("name")} for t in tags[:50]],
+            "all_names": [t.get("name","") for t in tags],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/debug/admin_user/<int:uid>")
+def debug_admin_user(uid):
+    """Retourne les champs bruts d'un admin user HBO."""
+    try:
+        cfg = load_config()
+        u = hbo(cfg, f"/admin_users/{uid}") or {}
+        return jsonify({"user_id": uid, "keys": list(u.keys()), "data": u})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "fb1c5d0"})
+    return jsonify({"status": "ok", "version": "d3f7a91"})
 
 # ─────────────────────────────────────────────
 # START
