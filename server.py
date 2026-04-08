@@ -500,19 +500,27 @@ def _get_all_front_tags(cfg):
             params = {"limit": 200}
             if page_token:
                 params["page_token"] = page_token
-            # Retry avec backoff exponentiel sur 429 — attente plus longue car la
-            # fenêtre rate-limit de Front est ~60s (16s ne suffisent pas).
-            for attempt in range(6):
+            # Retry avec backoff exponentiel sur 429.
+            # Fenêtre rate-limit Front ~60s → on tente jusqu'à 7 fois (max wait 60s).
+            for attempt in range(7):
                 r = requests.get(f"{base}/tags", headers=headers, params=params, timeout=30)
                 if r.status_code == 429:
-                    wait = min(2 ** attempt, 60)  # 1s, 2s, 4s, 8s, 16s, 60s
+                    # Respecter le header Retry-After si présent
+                    retry_after = r.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = int(retry_after) + 2
+                        except Exception:
+                            wait = min(2 ** attempt, 60)
+                    else:
+                        wait = min(2 ** attempt, 60)  # 1,2,4,8,16,32,60s
                     print(f"  ⏳ Front tags 429 (page {page_count+1}), retry dans {wait}s…", flush=True)
                     _time.sleep(wait)
                     continue
                 r.raise_for_status()
                 break
             else:
-                raise Exception(f"Front tags: 429 persistant après 6 tentatives (page {page_count+1})")
+                raise Exception(f"Front tags: 429 persistant après 7 tentatives (page {page_count+1})")
             data = r.json()
             all_tags.extend(data.get("_results", []))
             page_count += 1
@@ -520,8 +528,8 @@ def _get_all_front_tags(cfg):
             if not nxt or "page_token=" not in nxt:
                 break
             page_token = nxt.split("page_token=")[-1].split("&")[0]
-            # Pause inter-page pour éviter le rate-limit Front API (~50 req/min)
-            _time.sleep(0.8)
+            # Pause inter-page : 1.5s ≈ 40 req/min, sous la limite Front (~50 req/min)
+            _time.sleep(1.5)
 
         _front_tags_cache["data"]    = all_tags
         _front_tags_cache["expires"] = now + timedelta(hours=4)
