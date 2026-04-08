@@ -1051,6 +1051,36 @@ def buildings_status():
         "sample":        (_buildings_cache["data"] or [])[:3],
     })
 
+@app.route("/api/debug/project/<int:bid>")
+def debug_project(bid):
+    """Retourne les champs bruts d'un projet HBO pour diagnostiquer status/type."""
+    try:
+        cfg = load_config()
+        # Récupère la liste des IDs
+        raw_ids = list_items(hbo(cfg, f"/projects/{bid}"))
+        ids = []
+        for p in raw_ids:
+            if isinstance(p, int): ids.append(p)
+            elif isinstance(p, dict) and p.get("id"): ids.append(int(p["id"]))
+        # Prend les 5 premiers pour inspecter
+        samples = []
+        for pid in ids[:10]:
+            proj = hbo(cfg, f"/project/{pid}")
+            if proj:
+                samples.append({
+                    "id": pid,
+                    "status": proj.get("status"),
+                    "state":  proj.get("state"),
+                    "type":   proj.get("type"),
+                    "active": proj.get("active"),
+                    "closed": proj.get("closed"),
+                    "title":  (proj.get("description") or proj.get("title") or "")[:50],
+                    "all_keys": list(proj.keys()),
+                })
+        return jsonify({"building_id": bid, "total_ids": len(ids), "samples": samples})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
