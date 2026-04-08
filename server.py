@@ -228,19 +228,58 @@ def categorize(p):
         if kw in txt: return cat
     return "GESTION"
 
+def _extract_str(val):
+    """Extrait une string depuis un champ qui peut être string ou objet HBO."""
+    if not val:
+        return ""
+    if isinstance(val, str):
+        return val.lower().strip()
+    if isinstance(val, dict):
+        # HBO retourne souvent {"id":1,"name":"Inactif"} ou {"id":1,"label":"inactif"}
+        return (str(val.get("name") or val.get("label") or val.get("slug") or "")).lower().strip()
+    return str(val).lower().strip()
+
 def is_closed(p):
-    # HBO projects: status == "inactif" → clôturé
-    if str(p.get("status") or "").lower() == "inactif":
+    """Détecte si un projet HBO est clôturé/inactif.
+    HBO peut utiliser :
+      - status: "inactif" (string) ou {"name":"Inactif"} (objet)
+      - active: false (booléen)
+      - closed: true (booléen)
+      - state: "closed" / "done" etc.
+    """
+    # Booléens explicites
+    if p.get("active") is False:
         return True
-    st = str(p.get("status") or p.get("state") or "").lower()
-    return any(s in st for s in CLOSED_WORDS)
+    if p.get("closed") is True:
+        return True
+    # Champ status (string ou objet)
+    st = _extract_str(p.get("status"))
+    if st in ("inactif", "inactive", "closed", "clôturé", "cloture", "terminé", "termine",
+               "done", "completed", "archivé", "archive", "resolved", "clos"):
+        return True
+    # Champ state
+    state = _extract_str(p.get("state"))
+    if state in ("inactif", "inactive", "closed", "done", "completed", "resolved"):
+        return True
+    return False
+
+def _extract_hbo_type(p):
+    """Extrait le type de projet (string normalisée) depuis un champ string ou objet."""
+    raw = p.get("type")
+    if not raw:
+        return ""
+    if isinstance(raw, dict):
+        # {"id":1,"name":"Gestion"} ou {"id":1,"label":"gestion"}
+        return (str(raw.get("name") or raw.get("label") or raw.get("slug") or "")).lower().strip()
+    return str(raw).lower().strip()
 
 def to_projects_list(raw_items):
     """Convertit les projets HBO en liste plate pour le HTML."""
     result = []
     for p in raw_items:
-        # Utiliser le champ `type` HBO directement (gestion/travaux/litige/mutation/sinistre)
-        hbo_type = str(p.get("type") or "").lower()
+        # Extraire le type (gestion/travaux/litige/mutation/sinistre)
+        # Gérer string ET objet {"id":X,"name":"..."}
+        hbo_type = _extract_hbo_type(p)
         cat = HBO_TYPE_MAP.get(hbo_type) or p.get("category") or categorize(p)
         closed = is_closed(p)
         result.append({
@@ -368,10 +407,23 @@ def find_front_tag(cfg, bid, b_name=""):
     try:
         r = requests.get(f"{base}/tags", headers=headers, timeout=15)
         r.raise_for_status()
-        tags = r.json().get("_results", [])
-        # Regex: le BID apparaît comme nombre entier (pas collé à d'autres chiffres)
+        tags_data = r.json()
+        tags = tags_data.get("_results", [])
+        print(f"  🏷 Front: {len(tags)} tags total pour building {bid} '{b_name}'")
+        if tags:
+            print(f"    exemples: {[t.get('name','') for t in tags[:5]]}")
+
+        # 1) Regex: BID comme nombre entier
         pattern = _re.compile(r'(?<!\d)' + _re.escape(str(bid)) + r'(?!\d)')
         matching = [t for t in tags if pattern.search(t.get("name", ""))]
+
+        # 2) Si pas trouvé, chercher par mots du nom du bâtiment
+        if not matching and b_name:
+            words = [w.lower() for w in b_name.split() if len(w) > 2]
+            matching = [t for t in tags
+                        if any(w in t.get("name", "").lower() for w in words)]
+
+        print(f"  🏷 Front: {len(matching)} tag(s) trouvé(s) pour building {bid}: {[t.get('name') for t in matching]}")
         if not matching:
             return None
         if len(matching) == 1:
@@ -527,9 +579,12 @@ def fetch_projects_hbo(cfg, bid, max_workers=40):
                 if r:
                     results.append(r)
 
-        actifs   = sum(1 for p in results if p.get("status") != "inactif")
-        inactifs = len(results) - actifs
-        print(f"  ✅ Projets {bid}: {actifs} actifs / {inactifs} inactifs")
+        inactifs = sum(1 for p in results if is_closed(p))
+        actifs   = len(results) - inactifs
+        print(f"  ✅ Projets {bid}: {actifs} actifs / {inactifs} inactifs (total={len(results)})")
+        # Log un sample pour diagnostique
+        for p in results[:3]:
+            print(f"    sample: status={p.get('status')!r} active={p.get('active')!r} closed={p.get('closed')!r} type={p.get('type')!r}")
 
         _projects_cache[bid] = {"data": results, "expires": now + timedelta(hours=1)}
         return results
