@@ -1051,6 +1051,31 @@ def buildings_status():
         "sample":        (_buildings_cache["data"] or [])[:3],
     })
 
+@app.route("/api/debug/find_building")
+def debug_find_building():
+    """Recherche un bâtiment par nom dans la liste scannée ou via /building/{id}."""
+    name = (request.args.get("name") or "").lower().strip()
+    if not name:
+        return jsonify({"error": "param ?name= requis"}), 400
+    try:
+        cfg = load_config()
+        # Chercher dans le cache bâtiments
+        cached = _buildings_cache.get("data") or []
+        matches = [b for b in cached if name in b.get("name", "").lower()]
+        return jsonify({"query": name, "matches": matches, "total_cached": len(cached)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/debug/building/<int:bid>")
+def debug_building(bid):
+    """Retourne tous les champs bruts d'un bâtiment HBO."""
+    try:
+        cfg = load_config()
+        b = hbo(cfg, f"/building/{bid}") or {}
+        return jsonify({"building_id": bid, "keys": list(b.keys()), "data": b})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/debug/project/<int:bid>")
 def debug_project(bid):
     """Retourne les champs bruts d'un projet HBO pour diagnostiquer status/type."""
