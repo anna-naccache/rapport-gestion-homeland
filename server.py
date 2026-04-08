@@ -491,6 +491,7 @@ def _get_all_front_tags(cfg):
         if _front_tags_cache["data"] is not None and now < _front_tags_cache["expires"]:
             return _front_tags_cache["data"]
 
+        import time as _time
         base, token = cfg["front"]["base_url"], cfg["front"]["token"]
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         all_tags, page_token = [], None
@@ -499,8 +500,18 @@ def _get_all_front_tags(cfg):
             params = {"limit": 200}
             if page_token:
                 params["page_token"] = page_token
-            r = requests.get(f"{base}/tags", headers=headers, params=params, timeout=30)
-            r.raise_for_status()
+            # Retry avec backoff exponentiel sur 429 (rate limit Front API)
+            for attempt in range(5):
+                r = requests.get(f"{base}/tags", headers=headers, params=params, timeout=30)
+                if r.status_code == 429:
+                    wait = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
+                    print(f"  ⏳ Front tags 429 (page {page_count+1}), retry dans {wait}s…", flush=True)
+                    _time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                break
+            else:
+                raise Exception(f"Front tags: 429 persistant après 5 tentatives (page {page_count+1})")
             data = r.json()
             all_tags.extend(data.get("_results", []))
             page_count += 1
