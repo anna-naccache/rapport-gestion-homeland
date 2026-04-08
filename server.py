@@ -242,6 +242,16 @@ def _extract_str(val):
         return (str(val.get("name") or val.get("label") or val.get("slug") or "")).lower().strip()
     return str(val).lower().strip()
 
+def _extract_date(val):
+    """Extrait YYYY-MM-DD depuis : str, dict HBO {"date":"2026-03-06 00:00:00..."},
+    ou None. Retourne "" si vide ou invalide."""
+    if not val:
+        return ""
+    if isinstance(val, dict):
+        v = val.get("date") or ""
+        return str(v)[:10]
+    return str(val)[:10]
+
 def is_closed(p):
     """Détecte si un projet HBO est clôturé/inactif.
     Priorité : champ natif HBO 'projet_statut' ("inactif" = clôturé).
@@ -297,16 +307,29 @@ def to_projects_list(raw_items, date_start=None, date_end=None):
         closed = is_closed(p)
 
         # ── Dates ─────────────────────────────────────────────────────
-        start_date = (p.get("projet_start_date") or p.get("start_date")
-                      or p.get("startDate") or p.get("createdAt") or "")[:10]
-        end_date   = (p.get("projet_end_date") or p.get("end_date")
-                      or p.get("endDate") or p.get("closedAt") or "")[:10]
+        # _extract_date() gère str ET dict HBO {"date":"2026-03-06 00:00:00..."}
+        start_date = _extract_date(
+            p.get("projet_start_date") or p.get("start_date")
+            or p.get("startDate") or p.get("createdAt")
+        )
+        end_date = _extract_date(
+            p.get("projet_end_date") or p.get("end_date")
+            or p.get("endDate") or p.get("closedAt")
+        )
+        # Fallback endDate pour les projets clôturés : lastUpdate.updateDate
+        if not end_date and closed:
+            lu = p.get("lastUpdate") or {}
+            if isinstance(lu, dict):
+                end_date = _extract_date(lu.get("updateDate"))
+            if not end_date:
+                end_date = _extract_date(
+                    p.get("updateDate") or p.get("updatedAt") or p.get("updated_at")
+                )
 
         # ── Filtrage par période du rapport ────────────────────────────
         if date_start and date_end:
             if closed:
-                # Clôturé : filtrer par end_date si disponible, sinon par start_date.
-                # Si les deux sont vides, on inclut par défaut.
+                # Clôturé : filtrer par end_date (ou start_date si vide).
                 ref_date = end_date or start_date
                 if ref_date and (ref_date < date_start or ref_date > date_end):
                     continue
@@ -1180,6 +1203,8 @@ def get_building_data(bid):
         lots_count = (
             copro.get("copropriété_lotsppx") or copro.get("copropriete_lotsppx")
             or copro.get("lotsppx") or copro.get("lots_ppx") or copro.get("lots")
+            # Champs natifs de l'API HBO /building/{bid} (confirmés via interface web)
+            or b.get("nbLotsMain") or b.get("nbLotsTotal")
             or b.get("copropriété_lotsppx") or b.get("copropriete_lotsppx")
             or b.get("lotsppx") or b.get("lots") or b.get("lotsCount")
             or b.get("lotsPrincipaux") or b.get("numberOfLots") or b.get("nb_lots") or 0
