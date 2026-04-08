@@ -66,6 +66,7 @@ def load_config():
 _token_cache      = {"token": None, "expires": datetime.min}
 _buildings_cache  = {"data": None, "expires": datetime.min}
 _admin_users_cache = {"data": None, "expires": datetime.min}
+_front_tags_cache  = {"data": None, "expires": datetime.min}   # toutes les pages de tags Front
 
 BUILDINGS_CACHE_FILE = BASE_DIR / "buildings_cache.json"
 
@@ -399,45 +400,76 @@ def process_calls_v3(calls, admin_email_map=None):
 import re as _re
 
 def find_front_tag(cfg, bid, b_name=""):
-    """Trouve le tag Front du bâtiment (format 'NOM - BID'). Regex whole-number."""
+    """Trouve le tag Front du bâtiment en paginant toutes les pages (12k+ tags).
+    Format observé: '000632 16 RUE LEON JOST' — ID zéro-paddé + adresse.
+    Arrêt dès la première correspondance (early exit).
+    """
     if not cfg.get("front"):
         return None
     base, token = cfg["front"]["base_url"], cfg["front"]["token"]
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    # Pattern: BID comme entier (zero-padded ou brut) dans le nom du tag
+    bid_str   = str(bid)
+    bid_pad   = bid_str.zfill(6)          # ex: "000632"
+    pattern_id = _re.compile(
+        r'(?:^|[^0-9])(' + _re.escape(bid_pad) + r'|' + _re.escape(bid_str) + r')(?:[^0-9]|$)'
+    )
+    # Mots-clés du nom du bâtiment (longueur > 3) pour fallback
+    words_fb  = [w.lower() for w in b_name.split() if len(w) > 3] if b_name else []
+
     try:
-        r = requests.get(f"{base}/tags", headers=headers, timeout=15)
-        r.raise_for_status()
-        tags_data = r.json()
-        tags = tags_data.get("_results", [])
-        print(f"  🏷 Front: {len(tags)} tags total pour building {bid} '{b_name}'")
-        if tags:
-            print(f"    exemples: {[t.get('name','') for t in tags[:5]]}")
+        all_tags = _get_all_front_tags(cfg)
+        pages_scanned = 1
 
-        # 1) Regex: BID comme nombre entier
-        pattern = _re.compile(r'(?<!\d)' + _re.escape(str(bid)) + r'(?!\d)')
-        matching = [t for t in tags if pattern.search(t.get("name", ""))]
+        # Chercher par ID (zero-paddé ou brut)
+        for t in all_tags:
+            if pattern_id.search(t.get("name", "")):
+                print(f"  🏷 Front: tag trouvé — '{t.get('name')}'")
+                return t
 
-        # 2) Si pas trouvé, chercher par mots du nom du bâtiment
-        if not matching and b_name:
-            words = [w.lower() for w in b_name.split() if len(w) > 2]
-            matching = [t for t in tags
-                        if any(w in t.get("name", "").lower() for w in words)]
-
-        print(f"  🏷 Front: {len(matching)} tag(s) trouvé(s) pour building {bid}: {[t.get('name') for t in matching]}")
-        if not matching:
-            return None
-        if len(matching) == 1:
-            return matching[0]
-        # Plusieurs correspondances → préférer celle qui contient des mots du nom du bâtiment
-        if b_name:
-            words = [w.lower() for w in b_name.split() if len(w) > 3]
-            for t in matching:
-                if any(w in t["name"].lower() for w in words):
+        # Fallback par mots du nom du bâtiment
+        if words_fb:
+            for t in all_tags:
+                name = t.get("name", "").lower()
+                if any(w in name for w in words_fb):
+                    print(f"  🏷 Front: tag trouvé par nom — '{t.get('name')}'")
                     return t
-        return matching[0]
+
+        print(f"  ⚠ Front: aucun tag pour building {bid} (total tags={len(all_tags)})")
+        return None
     except Exception as e:
         print(f"  ⚠ Front find_tag({bid}): {e}")
         return None
+
+
+def _get_all_front_tags(cfg):
+    """Charge toutes les pages de tags Front avec cache 4h."""
+    global _front_tags_cache
+    now = datetime.now()
+    if _front_tags_cache["data"] is not None and now < _front_tags_cache["expires"]:
+        return _front_tags_cache["data"]
+
+    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    all_tags, page_token = [], None
+    while True:
+        params = {"limit": 200}
+        if page_token:
+            params["page_token"] = page_token
+        r = requests.get(f"{base}/tags", headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        all_tags.extend(data.get("_results", []))
+        nxt = data.get("_pagination", {}).get("next", "")
+        if not nxt or "page_token=" not in nxt:
+            break
+        page_token = nxt.split("page_token=")[-1].split("&")[0]
+
+    _front_tags_cache["data"]    = all_tags
+    _front_tags_cache["expires"] = now + timedelta(hours=4)
+    print(f"  ✅ Front tags cache: {len(all_tags)} tags chargés")
+    return all_tags
 
 def front_convs_for_tag(cfg, tag_id, date_start, date_end):
     """Conversations Front pour un tag, filtrées par date (pagination arrêtée si trop vieille)."""
@@ -1163,21 +1195,19 @@ def debug_project(bid):
 
 @app.route("/api/debug/front_tags")
 def debug_front_tags():
-    """Liste les tags Front (pour diagnostiquer CSAT manquant)."""
+    """Liste tous les tags Front avec pagination (pour diagnostiquer CSAT manquant)."""
     try:
         cfg = load_config()
         if not cfg.get("front"):
             return jsonify({"error": "Front non configuré"})
-        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        r = requests.get(f"{base}/tags", headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        tags = data.get("_results", [])
+        all_tags = _get_all_front_tags(cfg)
+        # Filtrer pour ne montrer que les tags de bâtiments (pas "Inbox")
+        bldg_tags = [t for t in all_tags if t.get("name","") not in ("Inbox","Starred","")]
         return jsonify({
-            "total": len(tags),
-            "sample": [{"id": t.get("id"), "name": t.get("name")} for t in tags[:50]],
-            "all_names": [t.get("name","") for t in tags],
+            "total_all": len(all_tags),
+            "total_building_tags": len(bldg_tags),
+            "sample_building": [{"id": t.get("id"), "name": t.get("name")} for t in bldg_tags[:30]],
+            "all_building_names": [t.get("name","") for t in bldg_tags[:200]],
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1227,7 +1257,7 @@ def debug_front_convs(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "a8c2e14"})
+    return jsonify({"status": "ok", "version": "c9f1b30"})
 
 # ─────────────────────────────────────────────
 # START
