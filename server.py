@@ -1347,44 +1347,64 @@ def debug_copropriete(bid):
 
 @app.route("/api/debug/building_full/<int:bid>")
 def debug_building_full(bid):
-    """Retourne TOUS les champs bruts du bâtiment HBO + essai /coproprietes liste."""
+    """Retourne TOUS les champs bruts du bâtiment HBO + multiples essais pour trouver lots."""
     try:
         cfg = load_config()
-        # 1. Tous les champs bruts du bâtiment
+        base = cfg["hbo"]["base_url"]
+        tok = hbo_token(cfg)
+        headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+
+        # 1. Tous les champs bruts du bâtiment (valeurs incluses)
         b_raw = hbo(cfg, f"/building/{bid}") or {}
+        immat = b_raw.get("immat", "")
+        syndic_id = b_raw.get("syndic_id")
 
-        # 2. Essai /coproprietes sans filtre (liste paginée)
-        copros_raw = hbo(cfg, "/coproprietes") or {}
-        copros_items = list_items(copros_raw)
-        copros_sample = copros_items[:3] if copros_items else None
-        copros_keys = list(copros_items[0].keys())[:30] if copros_items else None
+        # 2. POST /building/search avec immat (retourne-t-il plus de champs ?)
+        search_result = None
+        try:
+            r = requests.post(f"{base}/building/search", headers=headers,
+                              json={"immat": immat} if immat else {"id": bid}, timeout=15)
+            if r.status_code == 200:
+                items = list_items(r.json())
+                search_result = {"count": len(items), "first_keys": list(items[0].keys())[:30] if items else None,
+                                 "lot_fields": {k: v for item in items[:3] for k, v in item.items() if any(w in k.lower() for w in ["lot", "ppx", "copro", "unit"])}}
+            else:
+                search_result = {"status": r.status_code}
+        except Exception as e:
+            search_result = {"error": str(e)}
 
-        # 3. Essai /syndic/coproprietes
-        syndic_copros = hbo(cfg, "/syndic/coproprietes") or {}
-        syndic_items = list_items(syndic_copros)
-
-        # 4. Chercher dans la liste des coproprietes celle qui correspond au building
-        match = None
-        for item in copros_items[:200]:
-            if isinstance(item, dict):
-                if item.get("building_id") == bid or item.get("id") == bid:
-                    match = item
-                    break
-                immat = b_raw.get("immat", "")
-                if immat and item.get("immat") == immat:
-                    match = item
-                    break
+        # 3. Essais paths alternatifs lots
+        lot_paths = [
+            f"/building/{bid}/lots",
+            f"/lots",
+            f"/lots?building_id={bid}",
+            f"/building/{bid}/copropriete",
+        ]
+        if syndic_id:
+            lot_paths += [
+                f"/syndic/{syndic_id}/coproprietes",
+                f"/syndic/{syndic_id}/buildings/{bid}",
+            ]
+        lot_results = {}
+        for p in lot_paths:
+            r2 = hbo(cfg, p)
+            if r2 is not None:
+                items2 = list_items(r2)
+                lot_results[p] = {
+                    "type": type(r2).__name__,
+                    "keys": list(r2.keys())[:20] if isinstance(r2, dict) else None,
+                    "items_count": len(items2),
+                    "lot_fields": {k: v for k, v in (r2.items() if isinstance(r2, dict) else {}.items()) if any(w in k.lower() for w in ["lot", "ppx"])}
+                }
+            else:
+                lot_results[p] = None
 
         return jsonify({
             "building_id": bid,
-            "building_all_keys": list(b_raw.keys()),
+            "building_raw": b_raw,
             "building_lot_fields": {k: v for k, v in b_raw.items() if any(w in k.lower() for w in ["lot", "ppx", "copro", "unit"])},
-            "coproprietes_list_count": len(copros_items),
-            "coproprietes_first_keys": copros_keys,
-            "coproprietes_sample": copros_sample,
-            "coproprietes_match_for_building": match,
-            "syndic_coproprietes_count": len(syndic_items),
-            "syndic_coproprietes_sample": syndic_items[:2] if syndic_items else None,
+            "search_result": search_result,
+            "lot_paths": lot_results,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
