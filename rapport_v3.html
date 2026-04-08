@@ -876,7 +876,7 @@ function rVisits(data){
 
 /* Helper : render a project sub-list (En cours or Clos) */
 function _projRows(items){
-  return items.map(p=>`<tr><td>${p.name||'—'}</td></tr>`).join('');
+  return items.map(p=>`<tr><td>${p.name||'—'}</td></tr>`);
 }
 
 function rSin(data){
