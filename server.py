@@ -242,12 +242,13 @@ def _extract_str(val):
 
 def is_closed(p):
     """Détecte si un projet HBO est clôturé/inactif.
-    HBO peut utiliser :
-      - status: "inactif" (string) ou {"name":"Inactif"} (objet)
-      - active: false (booléen)
-      - closed: true (booléen)
-      - state: "closed" / "done" etc.
+    Priorité : champ natif HBO 'projet_statut' ("inactif" = clôturé).
+    Fallback sur les autres champs possibles.
     """
+    # Champ natif HBO (prioritaire)
+    ps = str(p.get("projet_statut") or "").lower().strip()
+    if ps in ("inactif", "inactive"):
+        return True
     # Booléens explicites
     if p.get("active") is False:
         return True
@@ -265,8 +266,10 @@ def is_closed(p):
     return False
 
 def _extract_hbo_type(p):
-    """Extrait le type de projet (string normalisée) depuis un champ string ou objet."""
-    raw = p.get("type")
+    """Extrait le type de projet (string normalisée) depuis un champ string ou objet.
+    Priorité : champ natif HBO 'projet_type', fallback sur 'type'.
+    """
+    raw = p.get("projet_type") or p.get("type")
     if not raw:
         return ""
     if isinstance(raw, dict):
@@ -274,20 +277,54 @@ def _extract_hbo_type(p):
         return (str(raw.get("name") or raw.get("label") or raw.get("slug") or "")).lower().strip()
     return str(raw).lower().strip()
 
-def to_projects_list(raw_items):
-    """Convertit les projets HBO en liste plate pour le HTML."""
+def to_projects_list(raw_items, date_start=None, date_end=None):
+    """Convertit les projets HBO en liste filtrée par période du rapport.
+
+    Champs natifs HBO utilisés (prioritaires) :
+      - projet_type        → catégorie (gestion/travaux/sinistre/mutation)
+      - projet_statut      → "actif" (ouvert) / "inactif" (clôturé)
+      - projet_start_date  → date d'ouverture (filtre pour projets actifs)
+      - projet_end_date    → date de clôture (filtre pour projets inactifs)
+      - projet_description → nom du projet
+
+    Règles de filtrage par période [date_start, date_end] :
+      - Projet actif   : inclus si projet_start_date est dans la période
+      - Projet inactif : inclus si projet_end_date est dans la période
+      - Si date absente : inclus sans filtrage (évite d'exclure des données)
+    """
     result = []
     for p in raw_items:
-        # Extraire le type (gestion/travaux/litige/mutation/sinistre)
-        # Gérer string ET objet {"id":X,"name":"..."}
+        # ── Type / catégorie ───────────────────────────────────────────
         hbo_type = _extract_hbo_type(p)
         cat = HBO_TYPE_MAP.get(hbo_type) or p.get("category") or categorize(p)
+
+        # ── Statut (projet_statut natif HBO prioritaire) ───────────────
         closed = is_closed(p)
+
+        # ── Dates ─────────────────────────────────────────────────────
+        start_date = (p.get("projet_start_date") or p.get("start_date")
+                      or p.get("startDate") or p.get("createdAt") or "")[:10]
+        end_date   = (p.get("projet_end_date") or p.get("end_date")
+                      or p.get("endDate") or p.get("closedAt") or "")[:10]
+
+        # ── Filtrage par période du rapport ────────────────────────────
+        if date_start and date_end:
+            ref_date = end_date if closed else start_date
+            if ref_date:  # si la date est connue, on filtre
+                if ref_date < date_start or ref_date > date_end:
+                    continue
+            # si ref_date est vide → on inclut le projet (pas assez d'info pour exclure)
+
+        # ── Nom du projet (projet_description natif HBO prioritaire) ───
+        name = (p.get("projet_description") or p.get("description")
+                or p.get("title") or p.get("name") or p.get("subject") or "—")
+
         result.append({
-            "name":       p.get("description") or p.get("title") or p.get("name") or p.get("subject") or "—",
+            "name":       name,
             "category":   cat,
             "status":     "Clos" if closed else "En cours",
-            "start_date": (p.get("start_date") or p.get("createdAt") or p.get("startDate") or "")[:10],
+            "start_date": start_date,
+            "end_date":   end_date,
         })
     return result
 
@@ -912,11 +949,12 @@ def get_building_data(bid):
         b      = hbo(cfg, f"/building/{bid}") or {}
         b_name = b.get("name", "")
 
-        # Log tous les champs du bâtiment
-        print(f"  🏢 Building {bid} keys: {list(b.keys())}")
+        # Log tous les champs du bâtiment pour diagnostic
+        print(f"  🏢 Building {bid} keys: {list(b.keys())}", flush=True)
         for k, v in b.items():
-            if any(w in k.lower() for w in ["referent", "accountant", "assistant", "user", "admin", "manager"]):
-                print(f"    → {k}: {v}")
+            if any(w in k.lower() for w in ["referent", "accountant", "assistant", "user", "admin",
+                                             "manager", "lot", "copro"]):
+                print(f"    → {k}: {v}", flush=True)
 
         def _field_id(obj):
             """Extrait l'ID depuis un objet ou un entier."""
@@ -1021,8 +1059,10 @@ def get_building_data(bid):
                       b.get("managedSince") or b.get("dateCreation") or "")
         if created_at: created_at = created_at[:10]
 
-        lots_count = (b.get("lots") or b.get("lotsCount") or b.get("lotsPrincipaux")
-                      or b.get("numberOfLots") or b.get("nb_lots") or 0)
+        # Champ natif HBO copropriétés : copropriété_lotsppx (prioritaire)
+        lots_count = (b.get("copropriété_lotsppx") or b.get("copropriete_lotsppx")
+                      or b.get("lotsppx") or b.get("lots") or b.get("lotsCount")
+                      or b.get("lotsPrincipaux") or b.get("numberOfLots") or b.get("nb_lots") or 0)
 
         result = {
             "building": {
@@ -1038,7 +1078,7 @@ def get_building_data(bid):
             # CSAT depuis les conversations Front du bâtiment
             "csat":      front_data.get("csat", {}),
             # Projets depuis HBO /projects/{bid} + détails
-            "projects":  to_projects_list(projs),
+            "projects":  to_projects_list(projs, date_start, date_end),
             # Incidents depuis HBO /incidents?building_id={bid}
             "incidents": to_incidents_list(incs),
             # Appels Ringover : service déduit via email interne → profil HBO
@@ -1251,7 +1291,7 @@ def debug_front_convs(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "f2c9b17"})
+    return jsonify({"status": "ok", "version": "a3d71fe"})
 
 # ─────────────────────────────────────────────
 # START
