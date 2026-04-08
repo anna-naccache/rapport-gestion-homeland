@@ -1337,6 +1337,50 @@ def debug_copropriete(bid):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/debug/building_full/<int:bid>")
+def debug_building_full(bid):
+    """Retourne TOUS les champs bruts du bâtiment HBO + essai /coproprietes liste."""
+    try:
+        cfg = load_config()
+        # 1. Tous les champs bruts du bâtiment
+        b_raw = hbo(cfg, f"/building/{bid}") or {}
+
+        # 2. Essai /coproprietes sans filtre (liste paginée)
+        copros_raw = hbo(cfg, "/coproprietes") or {}
+        copros_items = list_items(copros_raw)
+        copros_sample = copros_items[:3] if copros_items else None
+        copros_keys = list(copros_items[0].keys())[:30] if copros_items else None
+
+        # 3. Essai /syndic/coproprietes
+        syndic_copros = hbo(cfg, "/syndic/coproprietes") or {}
+        syndic_items = list_items(syndic_copros)
+
+        # 4. Chercher dans la liste des coproprietes celle qui correspond au building
+        match = None
+        for item in copros_items[:200]:
+            if isinstance(item, dict):
+                if item.get("building_id") == bid or item.get("id") == bid:
+                    match = item
+                    break
+                immat = b_raw.get("immat", "")
+                if immat and item.get("immat") == immat:
+                    match = item
+                    break
+
+        return jsonify({
+            "building_id": bid,
+            "building_all_keys": list(b_raw.keys()),
+            "building_lot_fields": {k: v for k, v in b_raw.items() if any(w in k.lower() for w in ["lot", "ppx", "copro", "unit"])},
+            "coproprietes_list_count": len(copros_items),
+            "coproprietes_first_keys": copros_keys,
+            "coproprietes_sample": copros_sample,
+            "coproprietes_match_for_building": match,
+            "syndic_coproprietes_count": len(syndic_items),
+            "syndic_coproprietes_sample": syndic_items[:2] if syndic_items else None,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/debug/front_tag/<int:bid>")
 def debug_front_tag(bid):
     """Vérifie si un tag Front est trouvé pour ce bâtiment."""
