@@ -1282,35 +1282,55 @@ def debug_front_tags():
 
 @app.route("/api/debug/copropriete/<int:bid>")
 def debug_copropriete(bid):
-    """Sonde plusieurs variantes de chemin HBO pour trouver les données copropriété (lots)."""
+    """Sonde plusieurs variantes de chemin HBO + immat pour trouver les données copropriété (lots)."""
     try:
         cfg = load_config()
-        paths = [
-            f"/copropriete/{bid}",
-            f"/coproprietes/{bid}",
-            f"/coproprietes",
-            f"/building/{bid}/copropriete",
-            f"/syndic/copropriete/{bid}",
+        # Récupère l'immat du bâtiment (ex: "AE1511005")
+        b = hbo(cfg, f"/building/{bid}") or {}
+        immat = b.get("immat") or ""
+
+        # Tous les chemins à tester
+        candidates = [
+            (f"/copropriete/{bid}", None),
+            (f"/coproprietes/{bid}", None),
+            (f"/building/{bid}/copropriete", None),
+            (f"/syndic/copropriete/{bid}", None),
+            (f"/coproprietes", {"building_id": bid}),
+            (f"/coproprietes", {"id": bid}),
         ]
+        if immat:
+            candidates += [
+                (f"/copropriete/{immat}", None),
+                (f"/coproprietes/{immat}", None),
+                (f"/coproprietes", {"immat": immat}),
+                (f"/coproprietes", {"immatriculation": immat}),
+            ]
+
         results = {}
-        for p in paths:
-            params = {"building_id": bid} if p == "/coproprietes" else None
+        for p, params in candidates:
+            key = f"{p}?{params}" if params else p
             raw = hbo(cfg, p, params=params)
             if raw is not None:
-                # Cherche les champs liés aux lots
                 data = raw if isinstance(raw, dict) else {}
                 items = list_items(raw) if isinstance(raw, (list, dict)) else []
                 lot_fields = {k: v for k, v in data.items() if any(w in k.lower() for w in ["lot", "ppx"])}
-                results[p] = {
+                # If it's a list, scan items for lot fields too
+                if items:
+                    for item in items[:3]:
+                        if isinstance(item, dict):
+                            for k, v in item.items():
+                                if any(w in k.lower() for w in ["lot", "ppx", "copro"]):
+                                    lot_fields[f"item.{k}"] = v
+                results[key] = {
                     "type": type(raw).__name__,
-                    "keys": list(data.keys())[:20],
+                    "keys": list(data.keys())[:20] if data else None,
                     "lot_fields": lot_fields,
                     "items_count": len(items),
-                    "sample": items[:2] if items else None,
+                    "first_item_keys": list(items[0].keys())[:20] if items and isinstance(items[0], dict) else None,
                 }
             else:
-                results[p] = None
-        return jsonify({"building_id": bid, "paths_tried": results})
+                results[key] = None
+        return jsonify({"building_id": bid, "immat": immat, "paths_tried": results})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
