@@ -67,6 +67,7 @@ _token_cache      = {"token": None, "expires": datetime.min}
 _buildings_cache  = {"data": None, "expires": datetime.min}
 _admin_users_cache = {"data": None, "expires": datetime.min}
 _front_tags_cache  = {"data": None, "expires": datetime.min}   # toutes les pages de tags Front
+_front_tags_lock   = None   # initialisé après import threading (voir bas du fichier)
 
 BUILDINGS_CACHE_FILE = BASE_DIR / "buildings_cache.json"
 
@@ -475,32 +476,43 @@ def find_front_tag(cfg, bid, b_name=""):
 
 
 def _get_all_front_tags(cfg):
-    """Charge toutes les pages de tags Front avec cache 4h."""
-    global _front_tags_cache
+    """Charge toutes les pages de tags Front avec cache 4h.
+    Utilise un Lock pour éviter la double-pagination si warmup + requête arrivent en même temps.
+    """
+    global _front_tags_cache, _front_tags_lock
     now = datetime.now()
+    # Lecture rapide sans lock (hot path)
     if _front_tags_cache["data"] is not None and now < _front_tags_cache["expires"]:
         return _front_tags_cache["data"]
 
-    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    all_tags, page_token = [], None
-    while True:
-        params = {"limit": 200}
-        if page_token:
-            params["page_token"] = page_token
-        r = requests.get(f"{base}/tags", headers=headers, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        all_tags.extend(data.get("_results", []))
-        nxt = data.get("_pagination", {}).get("next", "")
-        if not nxt or "page_token=" not in nxt:
-            break
-        page_token = nxt.split("page_token=")[-1].split("&")[0]
+    # Double-checked locking : un seul thread pagine, les autres attendent puis lisent le cache
+    with _front_tags_lock:
+        now = datetime.now()
+        if _front_tags_cache["data"] is not None and now < _front_tags_cache["expires"]:
+            return _front_tags_cache["data"]
 
-    _front_tags_cache["data"]    = all_tags
-    _front_tags_cache["expires"] = now + timedelta(hours=4)
-    print(f"  ✅ Front tags cache: {len(all_tags)} tags chargés", flush=True)
-    return all_tags
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        all_tags, page_token = [], None
+        page_count = 0
+        while True:
+            params = {"limit": 200}
+            if page_token:
+                params["page_token"] = page_token
+            r = requests.get(f"{base}/tags", headers=headers, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            all_tags.extend(data.get("_results", []))
+            page_count += 1
+            nxt = data.get("_pagination", {}).get("next", "")
+            if not nxt or "page_token=" not in nxt:
+                break
+            page_token = nxt.split("page_token=")[-1].split("&")[0]
+
+        _front_tags_cache["data"]    = all_tags
+        _front_tags_cache["expires"] = now + timedelta(hours=4)
+        print(f"  ✅ Front tags cache: {len(all_tags)} tags en {page_count} pages", flush=True)
+        return all_tags
 
 def front_convs_for_tag(cfg, tag_id, date_start, date_end):
     """Conversations Front pour un tag, filtrées par date (pagination arrêtée si trop vieille)."""
@@ -1002,6 +1014,7 @@ def get_building_data(bid):
             f_calls   = ex.submit(ringover_calls, cfg, date_start, date_end)
             f_front   = ex.submit(fetch_front_for_building, cfg, bid, b_name, date_start, date_end)
             f_admins  = ex.submit(get_admin_users_map, cfg)
+            f_copro   = ex.submit(lambda: hbo(cfg, f"/copropriete/{bid}") or {})
 
             manager_name    = f_mgr.result()
             accountant_name = f_acct.result()
@@ -1013,6 +1026,11 @@ def get_building_data(bid):
             all_calls = f_calls.result()
             front_data= f_front.result()   # {"convs": [...], "csat": {...}}
             admin_map = f_admins.result()
+            copro     = f_copro.result()
+            print(f"  🏢 Copropriete {bid} keys: {list(copro.keys())}", flush=True)
+            for k, v in copro.items():
+                if any(w in k.lower() for w in ["lot", "ppx", "copro"]):
+                    print(f"    → copro.{k}: {v}", flush=True)
 
         # Fallback noms gestionnaire/comptable — essai exhaustif des champs possibles
         def _extract_name(obj):
@@ -1059,10 +1077,15 @@ def get_building_data(bid):
                       b.get("managedSince") or b.get("dateCreation") or "")
         if created_at: created_at = created_at[:10]
 
-        # Champ natif HBO copropriétés : copropriété_lotsppx (prioritaire)
-        lots_count = (b.get("copropriété_lotsppx") or b.get("copropriete_lotsppx")
-                      or b.get("lotsppx") or b.get("lots") or b.get("lotsCount")
-                      or b.get("lotsPrincipaux") or b.get("numberOfLots") or b.get("nb_lots") or 0)
+        # Lots depuis /copropriete/{bid} (copropriété_lotsppx) en priorité, sinon /building/{bid}
+        lots_count = (
+            copro.get("copropriété_lotsppx") or copro.get("copropriete_lotsppx")
+            or copro.get("lotsppx") or copro.get("lots_ppx") or copro.get("lots")
+            or b.get("copropriété_lotsppx") or b.get("copropriete_lotsppx")
+            or b.get("lotsppx") or b.get("lots") or b.get("lotsCount")
+            or b.get("lotsPrincipaux") or b.get("numberOfLots") or b.get("nb_lots") or 0
+        )
+        print(f"  🏢 lots_count={lots_count} (copro keys={list(copro.keys())[:10]})", flush=True)
 
         result = {
             "building": {
@@ -1246,6 +1269,38 @@ def debug_front_tags():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/debug/copropriete/<int:bid>")
+def debug_copropriete(bid):
+    """Retourne tous les champs bruts de la copropriété HBO (pour diagnostiquer lots)."""
+    try:
+        cfg = load_config()
+        co = hbo(cfg, f"/copropriete/{bid}") or {}
+        lot_fields = {k: v for k, v in co.items() if any(w in k.lower() for w in ["lot", "ppx", "copro", "principal"])}
+        return jsonify({"building_id": bid, "keys": list(co.keys()), "lot_fields": lot_fields, "data": co})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/debug/front_tag/<int:bid>")
+def debug_front_tag(bid):
+    """Vérifie si un tag Front est trouvé pour ce bâtiment."""
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        b = hbo(cfg, f"/building/{bid}") or {}
+        b_name = b.get("name", "")
+        tag = find_front_tag(cfg, bid, b_name)
+        cache_size = len(_front_tags_cache.get("data") or [])
+        return jsonify({
+            "building_id": bid,
+            "building_name": b_name,
+            "tag_found": tag is not None,
+            "tag": {"id": tag.get("id"), "name": tag.get("name")} if tag else None,
+            "cache_size": cache_size,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/debug/admin_user/<int:uid>")
 def debug_admin_user(uid):
     """Retourne les champs bruts d'un admin user HBO."""
@@ -1325,6 +1380,7 @@ def _warmup():
         print(f"  ⚠ Warmup error: {e}", flush=True)
 
 import threading as _threading
+_front_tags_lock = _threading.Lock()   # évite la double-pagination (race condition warmup + requête)
 _threading.Thread(target=_warmup, daemon=True).start()
 
 if __name__ == "__main__":
