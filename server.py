@@ -1453,9 +1453,64 @@ def debug_front_convs(bid):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/debug/csat/<int:bid>")
+def debug_csat(bid):
+    """Diagnostic CSAT détaillé : tente conv detail + ratings endpoint."""
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        b = hbo(cfg, f"/building/{bid}") or {}
+        b_name = b.get("name", "")
+        tag = find_front_tag(cfg, bid, b_name)
+        if not tag:
+            return jsonify({"error": f"Aucun tag Front pour building {bid}"})
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        # 1. Conversations de la dernière semaine (pour trouver celles avec CSAT)
+        r1 = requests.get(f"{base}/tags/{tag['id']}/conversations",
+                          headers=headers, params={"limit": 5}, timeout=15)
+        r1.raise_for_status()
+        convs = r1.json().get("_results", [])
+
+        # 2. Détail d'une conversation (plus de champs que la liste)
+        conv_detail = None
+        if convs:
+            cid = convs[0]["id"]
+            try:
+                r2 = requests.get(f"{base}/conversations/{cid}", headers=headers, timeout=15)
+                r2.raise_for_status()
+                conv_detail = r2.json()
+            except Exception as e:
+                conv_detail = {"error": str(e)}
+
+        # 3. Essai endpoint /ratings (CSAT surveys Front)
+        ratings_result = None
+        try:
+            r3 = requests.get(f"{base}/ratings", headers=headers,
+                              params={"limit": 10}, timeout=15)
+            ratings_result = {"status": r3.status_code, "data": r3.json() if r3.ok else r3.text[:200]}
+        except Exception as e:
+            ratings_result = {"error": str(e)}
+
+        # 4. Scan les conversations pour trouver celles avec metadata.satisfaction non vide
+        rated = [c for c in convs if c.get("metadata", {}).get("satisfaction")]
+        return jsonify({
+            "tag": tag["name"],
+            "total_convs_sample": len(convs),
+            "convs_with_satisfaction": len(rated),
+            "conv_detail_keys": list(conv_detail.keys()) if isinstance(conv_detail, dict) and "error" not in conv_detail else conv_detail,
+            "conv_detail_metadata": conv_detail.get("metadata") if isinstance(conv_detail, dict) else None,
+            "ratings_endpoint": ratings_result,
+            "sample_conv_metadata": [c.get("metadata") for c in convs[:3]],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "a3d71fe"})
+    return jsonify({"status": "ok", "version": "1eda805"})
 
 # ─────────────────────────────────────────────
 # START
