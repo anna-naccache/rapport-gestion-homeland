@@ -400,43 +400,73 @@ def process_calls_v3(calls, admin_email_map=None):
 import re as _re
 
 def find_front_tag(cfg, bid, b_name=""):
-    """Trouve le tag Front du bâtiment en paginant toutes les pages (12k+ tags).
-    Format observé: '000632 16 RUE LEON JOST' — ID zéro-paddé + adresse.
-    Arrêt dès la première correspondance (early exit).
+    """Trouve le tag Front du bâtiment avec early-exit pagination.
+    - Si le cache global est chaud → recherche instantanée en mémoire.
+    - Sinon → pagination avec arrêt dès la première correspondance.
+    Format observé: '000632 16 RUE LEON JOST' (ID zero-paddé + adresse).
     """
     if not cfg.get("front"):
         return None
-    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-    # Pattern: BID comme entier (zero-padded ou brut) dans le nom du tag
-    bid_str   = str(bid)
-    bid_pad   = bid_str.zfill(6)          # ex: "000632"
+    bid_str    = str(bid)
+    bid_pad    = bid_str.zfill(6)   # ex: "000632"
     pattern_id = _re.compile(
         r'(?:^|[^0-9])(' + _re.escape(bid_pad) + r'|' + _re.escape(bid_str) + r')(?:[^0-9]|$)'
     )
-    # Mots-clés du nom du bâtiment (longueur > 3) pour fallback
-    words_fb  = [w.lower() for w in b_name.split() if len(w) > 3] if b_name else []
+    words_fb = [w.lower() for w in b_name.split() if len(w) > 3] if b_name else []
 
-    try:
-        all_tags = _get_all_front_tags(cfg)
-        pages_scanned = 1
-
-        # Chercher par ID (zero-paddé ou brut)
+    # --- Cas 1 : cache chaud → recherche immédiate ---
+    if _front_tags_cache["data"] is not None and datetime.now() < _front_tags_cache["expires"]:
+        all_tags = _front_tags_cache["data"]
         for t in all_tags:
             if pattern_id.search(t.get("name", "")):
-                print(f"  🏷 Front: tag trouvé — '{t.get('name')}'")
+                print(f"  🏷 Front (cache): tag '{t.get('name')}'")
                 return t
-
-        # Fallback par mots du nom du bâtiment
         if words_fb:
             for t in all_tags:
-                name = t.get("name", "").lower()
-                if any(w in name for w in words_fb):
-                    print(f"  🏷 Front: tag trouvé par nom — '{t.get('name')}'")
+                if any(w in t.get("name","").lower() for w in words_fb):
+                    print(f"  🏷 Front (cache/nom): tag '{t.get('name')}'")
                     return t
+        print(f"  ⚠ Front (cache): aucun tag pour building {bid}")
+        return None
 
-        print(f"  ⚠ Front: aucun tag pour building {bid} (total tags={len(all_tags)})")
+    # --- Cas 2 : cache froid → early-exit pagination ---
+    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        page_token, pages, fallback_candidates = None, 0, []
+        while True:
+            params = {"limit": 200}
+            if page_token:
+                params["page_token"] = page_token
+            r = requests.get(f"{base}/tags", headers=headers, params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            tags = data.get("_results", [])
+            pages += 1
+
+            for t in tags:
+                name = t.get("name", "")
+                if pattern_id.search(name):
+                    print(f"  🏷 Front: tag trouvé page {pages} — '{name}'")
+                    return t   # ← early exit dès qu'on trouve
+
+            if words_fb:
+                for t in tags:
+                    if any(w in t.get("name","").lower() for w in words_fb):
+                        fallback_candidates.append(t)
+
+            nxt = data.get("_pagination", {}).get("next", "")
+            if not nxt or "page_token=" not in nxt:
+                break
+            page_token = nxt.split("page_token=")[-1].split("&")[0]
+
+        if fallback_candidates:
+            t = fallback_candidates[0]
+            print(f"  🏷 Front (fallback nom): tag '{t.get('name')}'")
+            return t
+
+        print(f"  ⚠ Front: aucun tag pour building {bid} après {pages} pages")
         return None
     except Exception as e:
         print(f"  ⚠ Front find_tag({bid}): {e}")
@@ -1257,7 +1287,7 @@ def debug_front_convs(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "c9f1b30"})
+    return jsonify({"status": "ok", "version": "e5d8a42"})
 
 # ─────────────────────────────────────────────
 # START
