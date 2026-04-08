@@ -63,11 +63,12 @@ def load_config():
 # HBO  (JWT cache 8h)
 # ─────────────────────────────────────────────
 
-_token_cache      = {"token": None, "expires": datetime.min}
-_buildings_cache  = {"data": None, "expires": datetime.min}
-_admin_users_cache = {"data": None, "expires": datetime.min}
-_front_tags_cache  = {"data": None, "expires": datetime.min}   # toutes les pages de tags Front
-_front_tags_lock   = None   # initialisé après import threading (voir bas du fichier)
+_token_cache         = {"token": None, "expires": datetime.min}
+_buildings_cache     = {"data": None, "expires": datetime.min}
+_admin_users_cache   = {"data": None, "expires": datetime.min}
+_admin_users_id_cache= {"data": None, "expires": datetime.min}   # id → "Prénom Nom"
+_front_tags_cache    = {"data": None, "expires": datetime.min}   # toutes les pages de tags Front
+_front_tags_lock     = None   # initialisé après import threading (voir bas du fichier)
 
 BUILDINGS_CACHE_FILE = BASE_DIR / "buildings_cache.json"
 
@@ -281,17 +282,10 @@ def _extract_hbo_type(p):
 def to_projects_list(raw_items, date_start=None, date_end=None):
     """Convertit les projets HBO en liste filtrée par période du rapport.
 
-    Champs natifs HBO utilisés (prioritaires) :
-      - projet_type        → catégorie (gestion/travaux/sinistre/mutation)
-      - projet_statut      → "actif" (ouvert) / "inactif" (clôturé)
-      - projet_start_date  → date d'ouverture (filtre pour projets actifs)
-      - projet_end_date    → date de clôture (filtre pour projets inactifs)
-      - projet_description → nom du projet
-
-    Règles de filtrage par période [date_start, date_end] :
-      - Projet actif   : inclus si projet_start_date est dans la période
-      - Projet inactif : inclus si projet_end_date est dans la période
-      - Si date absente : inclus sans filtrage (évite d'exclure des données)
+    Règles de filtrage (spec utilisateur) :
+      - En cours (actif)  : TOUS les projets actifs, sans filtre de date
+      - Clos (inactif)    : UNIQUEMENT si projet_end_date est dans la période
+                            (si end_date absente → inclus par défaut)
     """
     result = []
     for p in raw_items:
@@ -310,11 +304,12 @@ def to_projects_list(raw_items, date_start=None, date_end=None):
 
         # ── Filtrage par période du rapport ────────────────────────────
         if date_start and date_end:
-            ref_date = end_date if closed else start_date
-            if ref_date:  # si la date est connue, on filtre
-                if ref_date < date_start or ref_date > date_end:
+            if closed:
+                # Clôturé : inclus seulement si end_date dans la période
+                # (si end_date vide → inclus, pas assez d'info pour exclure)
+                if end_date and (end_date < date_start or end_date > date_end):
                     continue
-            # si ref_date est vide → on inclut le projet (pas assez d'info pour exclure)
+            # Actif : aucun filtre de date → tous les projets actifs sont inclus
 
         # ── Nom du projet (projet_description natif HBO prioritaire) ───
         name = (p.get("projet_description") or p.get("description")
@@ -384,6 +379,34 @@ def get_admin_users_map(cfg):
         print(f"  ⚠ Admin users map: {e}")
         _admin_users_cache["data"]    = {}
         _admin_users_cache["expires"] = now + timedelta(minutes=10)
+        return {}
+
+def get_admin_users_id_map(cfg):
+    """Retourne dict id→'Prénom Nom' depuis HBO /admin_users. Cache 8h.
+    Utilisé pour résoudre added_by dans les buildings_events."""
+    global _admin_users_id_cache
+    now = datetime.now()
+    if _admin_users_id_cache["data"] is not None and now < _admin_users_id_cache["expires"]:
+        return _admin_users_id_cache["data"]
+    try:
+        data  = hbo(cfg, "/admin_users", {"itemsPerPage": 200})
+        users = list_items(data) if data else []
+        id_map = {}
+        for u in users:
+            uid = u.get("id")
+            if uid is None: continue
+            fn  = u.get("firstname") or u.get("firstName") or u.get("first_name") or ""
+            ln  = u.get("name") or u.get("lastName") or u.get("last_name") or ""
+            full = f"{fn} {ln}".strip() or u.get("email", f"#{uid}")
+            id_map[uid]       = full   # clé int
+            id_map[str(uid)]  = full   # clé str (robustesse)
+        _admin_users_id_cache["data"]    = id_map
+        _admin_users_id_cache["expires"] = now + timedelta(hours=8)
+        return id_map
+    except Exception as e:
+        print(f"  ⚠ Admin users id map: {e}")
+        _admin_users_id_cache["data"]    = {}
+        _admin_users_id_cache["expires"] = now + timedelta(minutes=10)
         return {}
 
 def get_service_for_call(call, admin_email_map):
@@ -775,9 +798,51 @@ def process_assemblies_v3(raw):
         })
     return sorted(result, key=lambda x: x["date"] or "0000", reverse=True)
 
-def process_visits_v3(assembs_raw, visits_raw=None):
-    """Toutes les assemblées/visites HBO (tous type_ids inclus)."""
-    return process_assemblies_v3(assembs_raw)
+def process_visits_v3(events_raw, admin_id_map=None, date_start=None, date_end=None):
+    """Traite les building_events HBO pour la page Visites & Assemblées.
+
+    Champs utilisés :
+      - meeting_type  → Type de visite (colonne 1)
+      - event_date    → Date (colonne 2)
+      - added_by      → id admin → résolu en 'Prénom Nom' (colonne 3)
+
+    Fallback si meeting_type/event_date absent : utilise les champs /assemblies
+    (meeting_date, type_id) pour compatibilité avec l'ancien endpoint.
+    """
+    admin_id_map = admin_id_map or {}
+    result = []
+    for e in events_raw:
+        # ── Date ──────────────────────────────────────────────────────
+        dt = e.get("event_date") or e.get("meeting_date") or ""
+        if isinstance(dt, dict):                # meeting_date = {"date": "2024-..."} (ancien format)
+            dt = dt.get("date") or ""
+        dt = str(dt or "")[:10]
+        if dt == "1970-01-01":
+            dt = ""
+
+        # ── Filtre période ─────────────────────────────────────────────
+        if date_start and date_end and dt:
+            if dt < date_start or dt > date_end:
+                continue
+
+        # ── Type de visite ─────────────────────────────────────────────
+        meeting_type = str(e.get("meeting_type") or e.get("type") or "").strip()
+        if not meeting_type:
+            type_id = e.get("type_id")
+            meeting_type = ASSEMBLY_TYPE_MAP.get(type_id, "Assemblée") if type_id else "Assemblée"
+
+        # ── Intervenant : added_by → nom admin ────────────────────────
+        added_by = e.get("added_by")
+        intervenant = ""
+        if added_by is not None:
+            intervenant = admin_id_map.get(added_by) or admin_id_map.get(str(added_by)) or ""
+
+        result.append({
+            "type":        meeting_type,
+            "date":        dt,
+            "intervenant": intervenant,
+        })
+    return sorted(result, key=lambda x: x["date"] or "0000", reverse=True)
 
 # ─────────────────────────────────────────────
 # ROUTES
@@ -1024,32 +1089,42 @@ def get_building_data(bid):
                 return f"{fname} {lname}".strip() or u.get("email", "")
             except Exception: return ""
 
-        # Tout en parallèle : HBO + Ringover + Front + admin map
-        with ThreadPoolExecutor(max_workers=12) as ex:
-            f_mgr     = ex.submit(admin_user_name, manager_id)
-            f_acct    = ex.submit(admin_user_name, accountant_id)
-            f_assist  = ex.submit(admin_user_name, assistant_id)
-            f_works   = ex.submit(lambda: list_items(hbo(cfg, f"/building/works/{bid}")))
-            f_projs   = ex.submit(fetch_projects_hbo, cfg, bid)
-            f_assembs = ex.submit(lambda: list_items(hbo(cfg, "/assemblies", {"building_id": bid})))
-            f_incs    = ex.submit(lambda: list_items(hbo(cfg, "/incidents",  {"building_id": bid})))
-            f_calls   = ex.submit(ringover_calls, cfg, date_start, date_end)
-            f_front   = ex.submit(fetch_front_for_building, cfg, bid, b_name, date_start, date_end)
-            f_admins  = ex.submit(get_admin_users_map, cfg)
-            f_copro   = ex.submit(lambda: hbo(cfg, f"/copropriete/{bid}") or {})
+        def _fetch_building_events(bid_):
+            """Essai /building/{bid}/events, fallback /assemblies."""
+            ev = list_items(hbo(cfg, f"/building/{bid_}/events"))
+            if not ev:
+                ev = list_items(hbo(cfg, "/assemblies", {"building_id": bid_}))
+            return ev
+
+        # Tout en parallèle : HBO + Ringover + Front + admin maps
+        with ThreadPoolExecutor(max_workers=14) as ex:
+            f_mgr       = ex.submit(admin_user_name, manager_id)
+            f_acct      = ex.submit(admin_user_name, accountant_id)
+            f_assist    = ex.submit(admin_user_name, assistant_id)
+            f_works     = ex.submit(lambda: list_items(hbo(cfg, f"/building/works/{bid}")))
+            f_projs     = ex.submit(fetch_projects_hbo, cfg, bid)
+            f_events    = ex.submit(_fetch_building_events, bid)
+            f_incs      = ex.submit(lambda: list_items(hbo(cfg, "/incidents",  {"building_id": bid})))
+            f_calls     = ex.submit(ringover_calls, cfg, date_start, date_end)
+            f_front     = ex.submit(fetch_front_for_building, cfg, bid, b_name, date_start, date_end)
+            f_admins    = ex.submit(get_admin_users_map, cfg)
+            f_admin_ids = ex.submit(get_admin_users_id_map, cfg)
+            f_copro     = ex.submit(lambda: hbo(cfg, f"/copropriete/{bid}") or {})
 
             manager_name    = f_mgr.result()
             accountant_name = f_acct.result()
             assistant_name  = f_assist.result()
-            works     = f_works.result()
-            projs     = f_projs.result() or to_projects_list(works)
-            assembs   = f_assembs.result()
-            incs      = f_incs.result()
-            all_calls = f_calls.result()
-            front_data= f_front.result()   # {"convs": [...], "csat": {...}}
-            admin_map = f_admins.result()
-            copro     = f_copro.result()
+            works       = f_works.result()
+            projs       = f_projs.result() or to_projects_list(works)
+            events      = f_events.result()
+            incs        = f_incs.result()
+            all_calls   = f_calls.result()
+            front_data  = f_front.result()   # {"convs": [...], "csat": {...}}
+            admin_map   = f_admins.result()
+            admin_id_map= f_admin_ids.result()
+            copro       = f_copro.result()
             print(f"  🏢 Copropriete {bid} keys: {list(copro.keys())}", flush=True)
+            print(f"  📅 Events {bid}: {len(events)} entrées", flush=True)
             for k, v in copro.items():
                 if any(w in k.lower() for w in ["lot", "ppx", "copro"]):
                     print(f"    → copro.{k}: {v}", flush=True)
@@ -1130,8 +1205,8 @@ def get_building_data(bid):
             "calls":     process_calls_v3(all_calls, admin_map),
             # Emails/CSAT Front filtrés par tag du bâtiment
             "emails":    process_emails_v3(front_data.get("convs", [])),
-            # Visites HBO (assemblées + visites)
-            "visits":    process_visits_v3(assembs),
+            # Visites & Assemblées (building_events + fallback assemblies)
+            "visits":    process_visits_v3(events, admin_id_map, date_start, date_end),
             "period": {
                 "start": date_start,
                 "end":   date_end,

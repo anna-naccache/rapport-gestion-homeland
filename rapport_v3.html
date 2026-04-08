@@ -296,6 +296,10 @@ body{
 /* Empty */
 .empty{padding:18px;text-align:center;color:#ccc;font-size:12px;font-style:italic;}
 
+/* Sub-section header inside a section (En cours / Archivés) */
+.sub-h{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--dg);margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--brd);}
+
 /* Page footer */
 .pf{
   border-top:1px solid var(--brd);
@@ -541,10 +545,10 @@ const DEMO={
   calls:{total:214,inbound:168,outbound:46,avg_duration_seconds:187,total_duration_hours:11.1,
     by_service:{gestion:{count:89,duration_seconds:18200},comptabilité:{count:52,duration_seconds:9400},support:{count:43,duration_seconds:7800},juridique:{count:18,duration_seconds:5600},autre:{count:12,duration_seconds:1600}}},
   visits:[
-    {name:"Assemblée Générale Ordinaire 2024",type:"AGO",date:"2024-06-12",status:"Tenu"},
-    {name:"Assemblée Générale Extraordinaire — Ravalement",type:"AGE",date:"2024-11-20",status:"Tenu"},
-    {name:"Visite technique — état des façades",type:"Visite",date:"2024-09-05",status:"Effectuée"},
-    {name:"Visite conseil syndical",type:"Visite",date:"2025-01-14",status:"Effectuée"},
+    {type:"AGO",date:"2024-06-12",intervenant:"Sophie Martin"},
+    {type:"AGE",date:"2024-11-20",intervenant:"Pierre Dubois"},
+    {type:"Visite technique",date:"2024-09-05",intervenant:"Frédéric Remeur"},
+    {type:"Visite conseil syndical",date:"2025-01-14",intervenant:"Sophie Martin"},
   ],
   incidents:[
     {name:"Dégât des eaux appartement 3B",category:"SINISTRES",status:"Clôturé",date:"2024-02-14"},
@@ -859,56 +863,74 @@ function rAppels(data){
 }
 
 function rVisits(data){
-  const all=data.visits||data.assemblies||[],w=document.getElementById('ag-w');
-  // Filtrer sur la période du rapport
-  const p=data.period||{},ds=p.start||'',de=p.end||'';
-  const visits=all.filter(a=>{
-    if(!a.date)return true;
-    if(ds&&a.date<ds)return false;
-    if(de&&a.date>de)return false;
-    return true;
-  });
-  if(!visits.length){
-    w.innerHTML='<div class="empty">Aucune visite / assemblée sur la période'+(all.length?` (${all.length} hors période)`:'')+'</div>';
+  const all=data.visits||[],w=document.getElementById('ag-w');
+  if(!all.length){
+    w.innerHTML='<div class="empty">Aucune visite / assemblée sur la période</div>';
     return;
   }
-  w.innerHTML=mkT(['Visite / Assemblée','Type','Date','Statut'],visits.map(a=>`<tr>
-    <td>${a.name||'Visite'}</td><td>${pill(a.type||'Visite','p-b')}</td>
-    <td style="font-size:11px;">${a.date?new Date(a.date).toLocaleDateString('fr-FR'):'—'}</td>
-    <td>${stP(a.status||'Tenu')}</td></tr>`));
+  w.innerHTML=mkT(['Type de visite','Date','Intervenant'],all.map(v=>`<tr>
+    <td>${v.type||'—'}</td>
+    <td style="white-space:nowrap;">${v.date?new Date(v.date+'T12:00:00').toLocaleDateString('fr-FR'):'—'}</td>
+    <td>${v.intervenant||'—'}</td></tr>`));
+}
+
+/* Helper : render a project sub-list (En cours or Clos) */
+function _projRows(items){
+  return items.map(p=>`<tr><td>${p.name||'—'}</td></tr>`).join('');
 }
 
 function rSin(data){
-  const all=data.incidents||[],sin=all.filter(i=>/sinistre/i.test(i.category||i.type||''));
-  const ouv=sin.filter(s=>!/clos|clôt|termin/i.test(s.status||'')),cl=sin.filter(s=>/clos|clôt|termin/i.test(s.status||''));
-  const rows=sin.slice(0,6).map(s=>`<tr><td>${s.name||s.description?.slice(0,50)||'—'}</td><td>${stP(s.status)}</td></tr>`);
-  document.getElementById('si-w').innerHTML=
-    `<div class="kg g3"><div class="kpi"><div class="kn">${sin.length}</div><div class="kl">Total</div></div>
-    <div class="kpi red"><div class="kn">${ouv.length}</div><div class="kl">En cours</div></div>
-    <div class="kpi"><div class="kn">${cl.length}</div><div class="kl">Clôturés</div></div></div>`
-    +mkT(['Désignation','Statut'],rows);
+  const projs=(data.projects||[]).filter(p=>/sinistre/i.test(p.category||''));
+  const enc=projs.filter(p=>p.status==='En cours');
+  const clos=projs.filter(p=>p.status==='Clos');
+  const w=document.getElementById('si-w');
+  let html='';
+  if(enc.length){
+    html+=`<div class="sub-h">En cours — ${enc.length} dossier${enc.length>1?'s':''}</div>`;
+    html+=mkT(['Description'],_projRows(enc));
+  }
+  if(clos.length){
+    html+=`<div class="sub-h">Archivés sur la période — ${clos.length} dossier${clos.length>1?'s':''}</div>`;
+    html+=mkT(['Description'],_projRows(clos));
+  }
+  if(!enc.length&&!clos.length){html='<div class="empty">Aucun sinistre</div>';}
+  w.innerHTML=html;
 }
 
 function rTr(data){
-  const all=[...(data.incidents||[]),...(data.projects||[])];
-  const tr=all.filter(i=>/travaux/i.test(i.category||i.type||''));
+  const projs=(data.projects||[]).filter(p=>/travaux/i.test(p.category||''));
+  const enc=projs.filter(p=>p.status==='En cours');
+  const clos=projs.filter(p=>p.status==='Clos');
   const w=document.getElementById('tr-w');
-  if(!tr.length){w.innerHTML='<div class="empty">Aucun travail sur la période</div>';return;}
-  w.innerHTML=mkT(['Désignation','Statut'],tr.slice(0,5).map(t=>`<tr>
-    <td>${t.name||t.title||'—'}</td><td>${stP(t.status)}</td></tr>`));
+  let html='';
+  if(enc.length){
+    html+=`<div class="sub-h">En cours — ${enc.length} dossier${enc.length>1?'s':''}</div>`;
+    html+=mkT(['Description'],_projRows(enc));
+  }
+  if(clos.length){
+    html+=`<div class="sub-h">Archivés sur la période — ${clos.length} dossier${clos.length>1?'s':''}</div>`;
+    html+=mkT(['Description'],_projRows(clos));
+  }
+  if(!enc.length&&!clos.length){html='<div class="empty">Aucun travaux</div>';}
+  w.innerHTML=html;
 }
 
 function rGes(data){
-  const all=data.incidents||[],g=all.filter(i=>!/sinistre|travaux/i.test(i.category||i.type||''));
-  const bc={};g.forEach(x=>{const c=x.category||'Autre';bc[c]=(bc[c]||0)+1;});
-  const cats=Object.keys(bc),w=document.getElementById('ge-w');
-  const rows=g.slice(0,8).map(x=>`<tr>
-    <td>${x.name||x.title||x.description?.slice(0,40)||'—'}</td>
-    <td>${catP(x.category)}</td><td>${stP(x.status)}</td></tr>`);
-  w.innerHTML=`<div class="kg g${Math.min(cats.length+1,4)}">
-    <div class="kpi"><div class="kn">${g.length}</div><div class="kl">Dossiers</div></div>
-    ${cats.slice(0,3).map(c=>`<div class="kpi">${catP(c)}<div class="kn" style="margin-top:4px;">${bc[c]}</div></div>`).join('')}
-  </div>`+mkT(['Désignation','Catégorie','Statut'],rows);
+  const projs=(data.projects||[]).filter(p=>/gestion/i.test(p.category||''));
+  const enc=projs.filter(p=>p.status==='En cours');
+  const clos=projs.filter(p=>p.status==='Clos');
+  const w=document.getElementById('ge-w');
+  let html='';
+  if(enc.length){
+    html+=`<div class="sub-h">En cours — ${enc.length} dossier${enc.length>1?'s':''}</div>`;
+    html+=mkT(['Description'],_projRows(enc));
+  }
+  if(clos.length){
+    html+=`<div class="sub-h">Archivés sur la période — ${clos.length} dossier${clos.length>1?'s':''}</div>`;
+    html+=mkT(['Description'],_projRows(clos));
+  }
+  if(!enc.length&&!clos.length){html='<div class="empty">Aucune gestion courante</div>';}
+  w.innerHTML=html;
 }
 
 // Auto-génère la démo au chargement
