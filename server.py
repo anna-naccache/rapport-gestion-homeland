@@ -629,26 +629,54 @@ def front_convs_for_tag(cfg, tag_id, date_start, date_end):
     return convs
 
 def front_csat_from_convs(convs):
-    """Extrait les scores CSAT des conversations Front (metadata.satisfaction.score)."""
+    """Extrait les scores CSAT des conversations Front.
+
+    Priorité d'extraction (Homeland stocke le rating dans les tags) :
+      1. Tags "Rating X/5"  (ex. tag name = "Rating 1/5")
+      2. metadata.satisfaction.survey_rating / score / rating
+      3. custom_fields contenant "csat" ou "satisfaction"
+    """
+    import re as _re
     SCORE_MAP = {
         "amazing": 5, "great": 5, "good": 4, "neutral": 3, "bad": 2, "awful": 1,
         "thumbs_up": 4, "thumbs_down": 2,
         "very_good": 5, "positive": 4, "negative": 2,
         "5": 5, "4": 4, "3": 3, "2": 2, "1": 1,
     }
+    _tag_rating_re = _re.compile(r"rating\s*(\d+)\s*/\s*5", _re.IGNORECASE)
+
     scores = []
+    survey_sent_count  = 0
+    no_response_count  = 0
+
     for c in convs:
-        meta = c.get("metadata") or {}
-        sat  = meta.get("satisfaction") or {}
-        # Front CSAT : priorité survey_rating (NPS numérique 1-5), puis score/rating (texte)
-        raw  = sat.get("survey_rating") or sat.get("score") or sat.get("rating")
+        raw = None
+
+        # ── 1. Tags "Rating X/5" (Homeland) ──────────────────────────────────
+        tags_names = [t.get("name", "") for t in (c.get("tags") or [])]
+        has_survey = any("survey sent" in tn.lower() for tn in tags_names)
+        if has_survey:
+            survey_sent_count += 1
+        for tn in tags_names:
+            m = _tag_rating_re.search(tn)
+            if m:
+                raw = int(m.group(1))
+                break
+
+        # ── 2. metadata.satisfaction (CSAT natif Front) ───────────────────────
         if raw is None:
-            # Essayer custom_fields
+            meta = c.get("metadata") or {}
+            sat  = meta.get("satisfaction") or {}
+            raw  = sat.get("survey_rating") or sat.get("score") or sat.get("rating")
+
+        # ── 3. custom_fields ──────────────────────────────────────────────────
+        if raw is None:
             for cf in (c.get("custom_fields") or []):
                 fname = str(cf.get("name") or "").lower()
                 if "csat" in fname or "satisfaction" in fname:
                     raw = cf.get("value")
                     break
+
         if raw is not None:
             if isinstance(raw, (int, float)):
                 score = float(raw)
@@ -659,15 +687,23 @@ def front_csat_from_convs(convs):
                 mapped = SCORE_MAP.get(str(raw).lower().strip())
                 if mapped:
                     scores.append(mapped)
+        elif has_survey:
+            no_response_count += 1
+
+    result = {
+        "count":         len(scores),
+        "survey_sent":   survey_sent_count,
+        "no_response":   no_response_count,
+    }
     if not scores:
-        return {}
+        return result
     avg  = round(sum(scores) / len(scores), 1)
     dist = Counter(round(s) for s in scores)
-    return {
+    result.update({
         "score":        avg,
         "distribution": {i: dist.get(i, 0) for i in range(1, 6)},
-        "count":        len(scores),
-    }
+    })
+    return result
 
 def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
     """Récupère conversations + CSAT Front pour un bâtiment (via son tag)."""
@@ -2092,23 +2128,34 @@ def debug_front_csat_account():
         if not cfg.get("front"):
             return jsonify({"error": "Front non configuré"})
 
+        import re as _re
+        _tag_re = _re.compile(r"rating\s*(\d+)\s*/\s*5", _re.IGNORECASE)
+
         result = fetch_front_csat_by_account(cfg, account_name, date_start, date_end)
         convs  = result["convs"]
 
-        # Conversations avec satisfaction renseignée
-        rated = [c for c in convs
-                 if c.get("metadata", {}).get("satisfaction")]
+        # Conversations avec satisfaction renseignée (via tag Rating X/5 ou metadata)
+        def _conv_rating(c):
+            for tn in [t.get("name","") for t in (c.get("tags") or [])]:
+                m = _tag_re.search(tn)
+                if m:
+                    return int(m.group(1))
+            sat = (c.get("metadata") or {}).get("satisfaction") or {}
+            return sat.get("survey_rating") or sat.get("score") or sat.get("rating")
+
+        rated = [c for c in convs if _conv_rating(c) is not None]
         # 10 premiers pour diagnostic
         samples = []
         for c in rated[:10]:
-            sat = c.get("metadata", {}).get("satisfaction", {})
+            rating = _conv_rating(c)
+            tags_names = [t.get("name","") for t in (c.get("tags") or [])]
             samples.append({
-                "id":            c.get("id"),
-                "subject":       (c.get("subject") or "")[:80],
-                "created_at":    c.get("created_at"),
-                "satisfaction":  sat,
-                "survey_rating": sat.get("survey_rating"),
-                "score":         sat.get("score"),
+                "id":          c.get("id"),
+                "subject":     (c.get("subject") or "")[:80],
+                "created_at":  c.get("created_at"),
+                "rating":      rating,
+                "tags":        tags_names,
+                "survey_sent": any("survey sent" in tn.lower() for tn in tags_names),
             })
 
         # Aussi lister les 5 premiers comptes trouvés pour valider la correspondance
@@ -2124,14 +2171,16 @@ def debug_front_csat_account():
             candidates = [{"error": str(ae)}]
 
         return jsonify({
-            "query_name":    account_name,
-            "date_range":    f"{date_start} → {date_end}",
+            "query_name":      account_name,
+            "date_range":      f"{date_start} → {date_end}",
             "account_matched": result["account"],
             "account_candidates": candidates,
-            "total_convs":   len(convs),
-            "rated_convs":   len(rated),
-            "csat":          result["csat"],
-            "samples":       samples,
+            "total_convs":     len(convs),
+            "rated_convs":     len(rated),
+            "survey_sent":     result["csat"].get("survey_sent", 0),
+            "no_response":     result["csat"].get("no_response", 0),
+            "csat":            result["csat"],
+            "samples":         samples,
         })
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -2160,7 +2209,7 @@ def debug_building_parcels(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "csat-contacts-v2"})
+    return jsonify({"status": "ok", "version": "csat-tag-rating-v4"})
 
 # ─────────────────────────────────────────────
 # START
