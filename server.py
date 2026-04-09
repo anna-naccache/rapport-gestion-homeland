@@ -640,7 +640,8 @@ def front_csat_from_convs(convs):
     for c in convs:
         meta = c.get("metadata") or {}
         sat  = meta.get("satisfaction") or {}
-        raw  = sat.get("score") or sat.get("rating")
+        # Front CSAT : priorité survey_rating (NPS numérique 1-5), puis score/rating (texte)
+        raw  = sat.get("survey_rating") or sat.get("score") or sat.get("rating")
         if raw is None:
             # Essayer custom_fields
             for cf in (c.get("custom_fields") or []):
@@ -684,6 +685,82 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
     except Exception as e:
         print(f"  ⚠ fetch_front_for_building({bid}): {e}")
         return {"convs": [], "csat": {}}
+
+def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
+    """Récupère CSAT Front en cherchant la copropriété par son nom de compte (account_name).
+
+    Approche :
+      1. GET /accounts?q=<account_name>  →  trouver le compte correspondant
+      2. GET /accounts/{id}/conversations → conversations filtrées par date
+      3. front_csat_from_convs()          → extraire survey_rating / score
+
+    Retourne : {"convs": [...], "csat": {...}, "account": {id, name}}
+    """
+    if not cfg.get("front"):
+        return {"convs": [], "csat": {}, "account": None}
+    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    start_ts = int(datetime.strptime(date_start, "%Y-%m-%d").timestamp())
+    end_ts   = int(datetime.strptime(date_end,   "%Y-%m-%d").timestamp()) + 86399  # fin de journée
+
+    try:
+        # ── 1. Trouver le compte par nom ──────────────────────────────────────
+        r = requests.get(f"{base}/accounts", headers=headers,
+                         params={"q": account_name, "limit": 20}, timeout=15)
+        r.raise_for_status()
+        accounts = r.json().get("_results", [])
+        if not accounts:
+            print(f"  ⚠ Front: aucun compte pour '{account_name}'", flush=True)
+            return {"convs": [], "csat": {}, "account": None}
+
+        # Correspondance exacte prioritaire, sinon premier résultat
+        account = None
+        name_up = account_name.upper()
+        for acc in accounts:
+            if acc.get("name", "").upper() == name_up:
+                account = acc
+                break
+        if not account:
+            account = accounts[0]
+
+        print(f"  🏷 Front account: '{account.get('name')}' (id={account.get('id')})", flush=True)
+
+        # ── 2. Conversations du compte filtrées par date ──────────────────────
+        convs, page_token, done = [], None, False
+        while len(convs) < 500 and not done:
+            params = {"limit": 100}
+            if page_token:
+                params["page_token"] = page_token
+            r2 = requests.get(f"{base}/accounts/{account['id']}/conversations",
+                              headers=headers, params=params, timeout=20)
+            r2.raise_for_status()
+            data  = r2.json()
+            items = data.get("_results", [])
+            if not items:
+                break
+            for c in items:
+                ts = c.get("created_at") or c.get("last_message_at") or 0
+                if ts and ts < start_ts:
+                    done = True   # dépassé la borne basse → stop pagination
+                    break
+                if ts <= end_ts:
+                    convs.append(c)
+            nxt = data.get("_pagination", {}).get("next", "")
+            if not nxt or "page_token=" not in nxt:
+                break
+            page_token = nxt.split("page_token=")[-1].split("&")[0]
+
+        csat = front_csat_from_convs(convs)
+        print(f"  ✅ Front account CSAT '{account.get('name')}': {len(convs)} convs, CSAT={csat.get('score')}", flush=True)
+        return {
+            "convs":   convs,
+            "csat":    csat,
+            "account": {"id": account.get("id"), "name": account.get("name")},
+        }
+    except Exception as e:
+        print(f"  ⚠ fetch_front_csat_by_account('{account_name}'): {e}", flush=True)
+        return {"convs": [], "csat": {}, "account": None}
+
 
 # ── HBO : projets avec détails + cache 1h par bâtiment ───────────
 
@@ -1131,8 +1208,17 @@ def get_building_data(bid):
                 ev = list_items(hbo(cfg, "/assemblies", {"building_id": bid_}))
             return ev
 
+        def _fetch_parcels(bid_):
+            """Essaie /building_parcels/{bid} pour récupérer nbLotsMain."""
+            data = hbo(cfg, f"/building_parcels/{bid_}")
+            if data is None:
+                return {}
+            if isinstance(data, list) and data:
+                return data[0] if isinstance(data[0], dict) else {}
+            return data if isinstance(data, dict) else {}
+
         # Tout en parallèle : HBO + Ringover + Front + admin maps
-        with ThreadPoolExecutor(max_workers=14) as ex:
+        with ThreadPoolExecutor(max_workers=15) as ex:
             f_mgr       = ex.submit(admin_user_name, manager_id)
             f_acct      = ex.submit(admin_user_name, accountant_id)
             f_assist    = ex.submit(admin_user_name, assistant_id)
@@ -1145,6 +1231,7 @@ def get_building_data(bid):
             f_admins    = ex.submit(get_admin_users_map, cfg)
             f_admin_ids = ex.submit(get_admin_users_id_map, cfg)
             f_copro     = ex.submit(lambda: hbo(cfg, f"/copropriete/{bid}") or {})
+            f_parcels   = ex.submit(_fetch_parcels, bid)
 
             manager_name    = f_mgr.result()
             accountant_name = f_acct.result()
@@ -1158,7 +1245,9 @@ def get_building_data(bid):
             admin_map   = f_admins.result()
             admin_id_map= f_admin_ids.result()
             copro       = f_copro.result()
+            parcels     = f_parcels.result()   # /building_parcels/{bid} → nbLotsMain ?
             print(f"  🏢 Copropriete {bid} keys: {list(copro.keys())}", flush=True)
+            print(f"  📦 Parcels {bid} keys: {list(parcels.keys()) if isinstance(parcels, dict) else type(parcels).__name__}", flush=True)
             print(f"  📅 Events {bid}: {len(events)} entrées", flush=True)
             for k, v in copro.items():
                 if any(w in k.lower() for w in ["lot", "ppx", "copro"]):
@@ -1209,17 +1298,24 @@ def get_building_data(bid):
                       b.get("managedSince") or b.get("dateCreation") or "")
         if created_at: created_at = created_at[:10]
 
-        # Lots depuis /copropriete/{bid} (copropriété_lotsppx) en priorité, sinon /building/{bid}
+        # Lots : /building_parcels/{bid} → nbLotsMain prioritaire (confirmé via session web)
+        # Fallback : /copropriete/{bid} → copropriété_lotsppx
+        # Fallback final : /building/{bid} (en général absent de l'API JWT)
         lots_count = (
-            copro.get("copropriété_lotsppx") or copro.get("copropriete_lotsppx")
+            # /building_parcels (essai JWT)
+            (parcels.get("nbLotsMain") or parcels.get("nbLotsTotal")
+             or parcels.get("nb_lots_main") or parcels.get("lotsMain"))
+            # /copropriete
+            or copro.get("copropriété_lotsppx") or copro.get("copropriete_lotsppx")
             or copro.get("lotsppx") or copro.get("lots_ppx") or copro.get("lots")
-            # Champs natifs de l'API HBO /building/{bid} (confirmés via interface web)
+            or copro.get("nbLotsMain") or copro.get("nbLotsTotal")
+            # /building (en général vide côté JWT)
             or b.get("nbLotsMain") or b.get("nbLotsTotal")
             or b.get("copropriété_lotsppx") or b.get("copropriete_lotsppx")
             or b.get("lotsppx") or b.get("lots") or b.get("lotsCount")
             or b.get("lotsPrincipaux") or b.get("numberOfLots") or b.get("nb_lots") or 0
         )
-        print(f"  🏢 lots_count={lots_count} (copro keys={list(copro.keys())[:10]})", flush=True)
+        print(f"  🏢 lots_count={lots_count} (parcels={list(parcels.keys())[:5]}, copro_keys={list(copro.keys())[:10]})", flush=True)
 
         result = {
             "building": {
@@ -1640,9 +1736,92 @@ def debug_csat(bid):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/debug/front_csat_account")
+def debug_front_csat_account():
+    """Test CSAT Front par account_name (copropriété).
+
+    Params GET :
+      ?name=SDC+93600+...  (défaut: SDC 93600 98-100 AVENUE ANATOLE FRANCE)
+      ?date_start=2026-03-02
+      ?date_end=2026-03-08
+    """
+    account_name = request.args.get("name", "SDC 93600 98-100 AVENUE ANATOLE FRANCE")
+    date_start   = request.args.get("date_start", "2026-03-02")
+    date_end     = request.args.get("date_end",   "2026-03-08")
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+
+        result = fetch_front_csat_by_account(cfg, account_name, date_start, date_end)
+        convs  = result["convs"]
+
+        # Conversations avec satisfaction renseignée
+        rated = [c for c in convs
+                 if c.get("metadata", {}).get("satisfaction")]
+        # 10 premiers pour diagnostic
+        samples = []
+        for c in rated[:10]:
+            sat = c.get("metadata", {}).get("satisfaction", {})
+            samples.append({
+                "id":            c.get("id"),
+                "subject":       (c.get("subject") or "")[:80],
+                "created_at":    c.get("created_at"),
+                "satisfaction":  sat,
+                "survey_rating": sat.get("survey_rating"),
+                "score":         sat.get("score"),
+            })
+
+        # Aussi lister les 5 premiers comptes trouvés pour valider la correspondance
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            r_acc = requests.get(f"{base}/accounts", headers=headers,
+                                 params={"q": account_name, "limit": 5}, timeout=15)
+            r_acc.raise_for_status()
+            candidates = [{"id": a.get("id"), "name": a.get("name")}
+                          for a in r_acc.json().get("_results", [])]
+        except Exception as ae:
+            candidates = [{"error": str(ae)}]
+
+        return jsonify({
+            "query_name":    account_name,
+            "date_range":    f"{date_start} → {date_end}",
+            "account_matched": result["account"],
+            "account_candidates": candidates,
+            "total_convs":   len(convs),
+            "rated_convs":   len(rated),
+            "csat":          result["csat"],
+            "samples":       samples,
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/debug/building_parcels/<int:bid>")
+def debug_building_parcels(bid):
+    """Retourne la réponse brute de /building_parcels/{bid} (pour diagnostiquer lots)."""
+    try:
+        cfg  = load_config()
+        data = hbo(cfg, f"/building_parcels/{bid}")
+        return jsonify({
+            "building_id": bid,
+            "raw":         data,
+            "type":        type(data).__name__,
+            "keys":        list(data.keys()) if isinstance(data, dict) else None,
+            "count":       len(data) if isinstance(data, list) else None,
+            "lot_fields":  ({k: v for k, v in data.items()
+                             if any(w in k.lower() for w in ["lot", "ppx", "main", "unit"])}
+                            if isinstance(data, dict) else None),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "1eda805"})
+    return jsonify({"status": "ok", "version": "csat-account-v1"})
 
 # ─────────────────────────────────────────────
 # START
