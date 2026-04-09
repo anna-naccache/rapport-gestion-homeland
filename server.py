@@ -826,10 +826,18 @@ def _fetch_account_convs_direct(base, headers, account_id, start_ts, end_ts):
     return convs
 
 
-def _fetch_account_convs_via_contacts(base, headers, account_id, start_ts, end_ts):
+def _fetch_account_convs_via_contacts(base, headers, account_id, start_ts, end_ts,
+                                       use_updated_at=False, extra_lookback_days=0):
     """Fallback : compte → contacts → conversations (sans module CRM).
-    Retourne la liste de conversations filtrées."""
+
+    use_updated_at      : True → utilise updated_at pour l'inclusion (conversations
+                          créées avant la fenêtre mais mises à jour pendant, ex. CSAT).
+    extra_lookback_days : repousse la fenêtre d'early-stop de N jours en arrière.
+                          Utile avec use_updated_at pour ne pas stopper trop tôt.
+    """
     import time as _time
+    # Limite inférieure pour l'early-stop (eviter de parcourir toute l'histoire)
+    fetch_start = start_ts - extra_lookback_days * 86400
 
     # 1. Récupérer les contacts du compte
     contacts, page_token = [], None
@@ -878,11 +886,15 @@ def _fetch_account_convs_via_contacts(base, headers, account_id, start_ts, end_t
             if not items:
                 break
             for c in items:
-                ts = c.get("created_at") or c.get("last_message_at") or 0
-                if ts and ts < start_ts:
+                created_ts = c.get("created_at") or 0
+                # active_ts : timestamp représentatif de l'activité récente
+                active_ts  = (c.get("updated_at") or created_ts) if use_updated_at else created_ts
+                # Early stop sur created_at (borné par fetch_start)
+                if created_ts and created_ts < fetch_start:
                     done = True
                     break
-                if ts and ts <= end_ts:
+                # Inclusion : actif pendant [start_ts, end_ts]
+                if active_ts and start_ts <= active_ts <= end_ts:
                     result.append(c)
             nxt = data.get("_pagination", {}).get("next", "")
             if not nxt or "page_token=" not in nxt:
@@ -947,13 +959,25 @@ def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
         print(f"  🏷 Front account: '{account.get('name')}' (id={account.get('id')})", flush=True)
 
         # ── 2. Conversations du compte filtrées par date ──────────────────────
+        # Pour le CSAT on utilise updated_at + lookback 30j :
+        # une conversation créée le 29/03 notée le 03/04 doit être capturée.
+        CSAT_LOOKBACK = 30  # jours
+
         # Essai 1 : GET /accounts/{id}/conversations (requiert module CRM Front)
-        convs = _fetch_account_convs_direct(base, headers, account["id"], start_ts, end_ts)
+        convs = _fetch_account_convs_direct(base, headers, account["id"],
+                                             start_ts - CSAT_LOOKBACK * 86400, end_ts)
+        if convs is not None:
+            # Filtrer ici sur updated_at pour ne garder que celles actives pendant la fenêtre
+            convs = [c for c in convs
+                     if start_ts <= (c.get("updated_at") or c.get("created_at") or 0) <= end_ts]
 
         # Essai 2 : si 404 (module CRM absent), passer par les contacts du compte
         if convs is None:
             print(f"  ↩ Fallback contacts pour {account['id']}", flush=True)
-            convs = _fetch_account_convs_via_contacts(base, headers, account["id"], start_ts, end_ts)
+            convs = _fetch_account_convs_via_contacts(
+                base, headers, account["id"], start_ts, end_ts,
+                use_updated_at=True, extra_lookback_days=CSAT_LOOKBACK
+            )
 
         csat = front_csat_from_convs(convs)
         print(f"  ✅ Front account CSAT '{account.get('name')}': {len(convs)} convs, CSAT={csat.get('score')}", flush=True)
@@ -965,6 +989,178 @@ def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
     except Exception as e:
         print(f"  ⚠ fetch_front_csat_by_account('{account_name}'): {e}", flush=True)
         return {"convs": [], "csat": {}, "account": None}
+
+
+# ── Front : comptage emails (messages) par copropriété ────────────
+
+def find_front_tag_by_account_name(cfg, account_name):
+    """Trouve le tag Front correspondant à un compte (copropriété) par son nom.
+
+    Les tags Homeland ont la forme : '{account_name} - {building_id}'
+    ex. 'SDC 92300 18 RUE GREFFULHE - 5 RUE JEAN GABIN - 671'
+    """
+    try:
+        all_tags = _get_all_front_tags(cfg)
+    except Exception:
+        return None
+    name_up = account_name.upper().strip()
+
+    # Correspondance exacte ou prefix (tag = account_name + ' - NNN')
+    for t in all_tags:
+        tag_up = (t.get("name") or "").upper().strip()
+        if tag_up == name_up or tag_up.startswith(name_up + " -"):
+            return t
+
+    # Fallback : tous les mots significatifs présents dans le tag
+    words = [w for w in name_up.split() if len(w) > 3]
+    if words:
+        for t in all_tags:
+            tag_up = (t.get("name") or "").upper()
+            if all(w in tag_up for w in words):
+                return t
+    return None
+
+
+def _count_messages_in_conv(base, headers, conv_id, start_ts, end_ts):
+    """Compte les messages (inbound/outbound) dans [start_ts, end_ts] pour une conversation."""
+    import time as _time
+    sent, received = 0, 0
+    page_token = None
+    while True:
+        params = {"limit": 100}
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            r = requests.get(f"{base}/conversations/{conv_id}/messages",
+                             headers=headers, params=params, timeout=20)
+            if r.status_code == 429:
+                _time.sleep(int(r.headers.get("Retry-After", "10")))
+                continue
+            if not r.ok:
+                break
+        except Exception:
+            break
+        data  = r.json()
+        items = data.get("_results", [])
+        if not items:
+            break
+        found_any = False
+        for m in items:
+            msg_ts = m.get("created_at") or 0
+            if msg_ts and msg_ts < start_ts:
+                # Messages Front triés du plus récent au plus ancien → on peut arrêter
+                return sent, received
+            if msg_ts and msg_ts <= end_ts:
+                found_any = True
+                if m.get("is_inbound"):
+                    received += 1
+                else:
+                    sent += 1
+        if not found_any:
+            break
+        nxt = data.get("_pagination", {}).get("next", "")
+        if not nxt or "page_token=" not in nxt:
+            break
+        page_token = nxt.split("page_token=")[-1].split("&")[0]
+    return sent, received
+
+
+def fetch_front_email_count_by_account(cfg, account_name, date_start, date_end):
+    """Compte les emails échangés pour une copropriété sur une période.
+
+    Méthode :
+      1. Conversations portant le tag de la copropriété (créées ou mises à jour pendant la période)
+      2. Conversations via contacts du compte Front (sans le tag, ou pour compléter)
+      Union dédupliquée → pour chaque conv, compte messages [start, end] inbound/outbound.
+
+    Retourne dict avec sent, received, total, convs_counted, tag_name, account_matched.
+    """
+    if not cfg.get("front"):
+        return {"error": "Front non configuré"}
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+    headers  = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    start_ts = int(datetime.strptime(date_start, "%Y-%m-%d").timestamp())
+    end_ts   = int(datetime.strptime(date_end,   "%Y-%m-%d").timestamp()) + 86399
+
+    # ── 1. Trouver le compte ──────────────────────────────────────────────────
+    all_accounts = _get_all_front_accounts(cfg)
+    name_up  = account_name.upper().strip()
+    account  = None
+    for acc in all_accounts:
+        if (acc.get("name") or "").upper().strip() == name_up:
+            account = acc; break
+    if not account:
+        words = [w for w in name_up.split() if len(w) > 3]
+        for acc in all_accounts:
+            if words and all(w in (acc.get("name") or "").upper() for w in words):
+                account = acc; break
+    if not account:
+        return {"error": f"Compte non trouvé : {account_name}"}
+
+    account_id   = account["id"]
+    account_name_matched = account.get("name", account_name)
+
+    # ── 2. Conversations via le tag copropriété ───────────────────────────────
+    tag = find_front_tag_by_account_name(cfg, account_name_matched)
+    tag_convs = []
+    tag_name  = None
+    if tag:
+        tag_name = tag.get("name")
+        tag_id   = tag["id"]
+        # front_convs_for_tag filtre sur created_at — on étend de 7j pour mails en cours
+        raw_tag_convs = front_convs_for_tag(cfg, tag_id,
+            (datetime.fromtimestamp(start_ts - 7*86400)).strftime("%Y-%m-%d"), date_end)
+        for c in raw_tag_convs:
+            # Garder si un message existe dans la fenêtre (on vérifie plus loin)
+            tag_convs.append(c)
+        print(f"  📌 Email count: {len(tag_convs)} convs via tag '{tag_name}'", flush=True)
+
+    # ── 3. Conversations via contacts du compte ───────────────────────────────
+    account_convs = _fetch_account_convs_via_contacts(
+        base, headers, account_id, start_ts, end_ts,
+        use_updated_at=False, extra_lookback_days=7
+    )
+    print(f"  📌 Email count: {len(account_convs)} convs via account contacts", flush=True)
+
+    # ── 4. Dédupliquer ────────────────────────────────────────────────────────
+    seen_ids, all_convs = set(), []
+    for c in tag_convs + account_convs:
+        cid = c.get("id")
+        if cid and cid not in seen_ids:
+            seen_ids.add(cid)
+            all_convs.append(c)
+    print(f"  📌 Email count: {len(all_convs)} convs uniques au total", flush=True)
+
+    # ── 5. Compter messages pour chaque conv (en parallèle, max 8 workers) ────
+    def _count_conv(c):
+        cid  = c.get("id")
+        s, r = _count_messages_in_conv(base, headers, cid, start_ts, end_ts)
+        return {"id": cid, "subject": (c.get("subject") or "")[:60], "sent": s, "received": r}
+
+    per_conv = []
+    with _TPE(max_workers=8) as ex:
+        futs = [ex.submit(_count_conv, c) for c in all_convs]
+        for fut in futs:
+            per_conv.append(fut.result())
+
+    per_conv = [p for p in per_conv if p["sent"] + p["received"] > 0]
+    total_sent     = sum(p["sent"]     for p in per_conv)
+    total_received = sum(p["received"] for p in per_conv)
+
+    return {
+        "account_matched": account_name_matched,
+        "tag_name":        tag_name,
+        "date_range":      f"{date_start} → {date_end}",
+        "sent":            total_sent,
+        "received":        total_received,
+        "total":           total_sent + total_received,
+        "convs_with_msgs": len(per_conv),
+        "convs_total":     len(all_convs),
+        "per_conv":        per_conv,
+    }
 
 
 # ── HBO : projets avec détails + cache 1h par bâtiment ───────────
@@ -2187,6 +2383,29 @@ def debug_front_csat_account():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/debug/front_email_count")
+def debug_front_email_count():
+    """Compte les emails (sent + received) pour une copropriété sur une période.
+
+    Params GET :
+      ?name=SDC+92300+18+RUE+GREFFULHE+-+5+RUE+JEAN+GABIN
+      ?date_start=2026-04-02
+      ?date_end=2026-04-08
+    """
+    account_name = request.args.get("name", "SDC 93600 98-100 AVENUE ANATOLE FRANCE")
+    date_start   = request.args.get("date_start", "2026-03-02")
+    date_end     = request.args.get("date_end",   "2026-03-08")
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        result = fetch_front_email_count_by_account(cfg, account_name, date_start, date_end)
+        return jsonify(result)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/debug/building_parcels/<int:bid>")
 def debug_building_parcels(bid):
     """Retourne la réponse brute de /building_parcels/{bid} (pour diagnostiquer lots)."""
@@ -2209,7 +2428,7 @@ def debug_building_parcels(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "csat-tag-rating-v4"})
+    return jsonify({"status": "ok", "version": "email-count-v5"})
 
 # ─────────────────────────────────────────────
 # START
