@@ -979,6 +979,27 @@ def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
                 use_updated_at=True, extra_lookback_days=CSAT_LOOKBACK
             )
 
+        # ── 3. Compléter avec les conversations du TAG de la copropriété ─────
+        # Certaines convs (ex. envoyées par un contact non lié au compte Front)
+        # ne remontent pas via les contacts → on les récupère via le tag.
+        tag = find_front_tag_by_account_name(cfg, account.get("name", account_name))
+        if tag:
+            tag_start = (datetime.fromtimestamp(start_ts - CSAT_LOOKBACK * 86400)
+                         .strftime("%Y-%m-%d"))
+            tag_end   = (datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d"))
+            tag_convs = front_convs_for_tag(cfg, tag["id"], tag_start, tag_end)
+            # Filtrer sur updated_at puis dédupliquer
+            existing_ids = {c.get("id") for c in convs}
+            added = 0
+            for c in tag_convs:
+                active_ts = c.get("updated_at") or c.get("created_at") or 0
+                if start_ts <= active_ts <= end_ts and c.get("id") not in existing_ids:
+                    convs.append(c)
+                    existing_ids.add(c.get("id"))
+                    added += 1
+            if added:
+                print(f"  ➕ +{added} convs via tag '{tag.get('name')}'", flush=True)
+
         csat = front_csat_from_convs(convs)
         print(f"  ✅ Front account CSAT '{account.get('name')}': {len(convs)} convs, CSAT={csat.get('score')}", flush=True)
         return {
@@ -2366,6 +2387,18 @@ def debug_front_csat_account():
         except Exception as ae:
             candidates = [{"error": str(ae)}]
 
+        # Toutes les convs avec leur tag list (pour diagnostiquer la 2ème note manquante)
+        all_tags_summary = []
+        for c in convs:
+            tag_names = [t.get("name","") for t in (c.get("tags") or [])]
+            all_tags_summary.append({
+                "id":       c.get("id"),
+                "subject":  (c.get("subject") or "")[:60],
+                "updated":  c.get("updated_at"),
+                "rating":   _conv_rating(c),
+                "tags":     tag_names,
+            })
+
         return jsonify({
             "query_name":      account_name,
             "date_range":      f"{date_start} → {date_end}",
@@ -2377,6 +2410,7 @@ def debug_front_csat_account():
             "no_response":     result["csat"].get("no_response", 0),
             "csat":            result["csat"],
             "samples":         samples,
+            "all_convs_tags":  all_tags_summary,
         })
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -2428,7 +2462,7 @@ def debug_building_parcels(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "email-count-v5"})
+    return jsonify({"status": "ok", "version": "csat-tag-union-v6"})
 
 # ─────────────────────────────────────────────
 # START
