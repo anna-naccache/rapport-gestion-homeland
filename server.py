@@ -688,39 +688,65 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
 
 _front_accounts_cache = {"data": None, "expires": datetime.min}
 
+_front_accounts_lock = None   # initialisé après import threading
+
 def _get_all_front_accounts(cfg):
     """Charge tous les comptes Front avec cache 4h (pagination côté serveur).
     Le paramètre ?q= de l'API /accounts ne filtre pas par nom — on pagine tout
     et on cherche localement.
+    Gère les 429 avec Retry-After + backoff exponentiel, pause 1.5s inter-page.
     """
-    global _front_accounts_cache
+    global _front_accounts_cache, _front_accounts_lock
+    import time as _time
     now = datetime.now()
     if _front_accounts_cache["data"] is not None and now < _front_accounts_cache["expires"]:
         return _front_accounts_cache["data"]
 
-    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    all_accounts, page_token = [], None
-    while len(all_accounts) < 10000:
-        params = {"limit": 100}
-        if page_token:
-            params["page_token"] = page_token
-        r = requests.get(f"{base}/accounts", headers=headers, params=params, timeout=20)
-        r.raise_for_status()
-        data  = r.json()
-        items = data.get("_results", [])
-        if not items:
-            break
-        all_accounts.extend(items)
-        nxt = data.get("_pagination", {}).get("next", "")
-        if not nxt or "page_token=" not in nxt:
-            break
-        page_token = nxt.split("page_token=")[-1].split("&")[0]
+    with _front_accounts_lock:
+        now = datetime.now()
+        if _front_accounts_cache["data"] is not None and now < _front_accounts_cache["expires"]:
+            return _front_accounts_cache["data"]
 
-    _front_accounts_cache["data"]    = all_accounts
-    _front_accounts_cache["expires"] = now + timedelta(hours=4)
-    print(f"  ✅ Front accounts cache: {len(all_accounts)} comptes", flush=True)
-    return all_accounts
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        all_accounts, page_token, page_count = [], None, 0
+
+        while len(all_accounts) < 10000:
+            params = {"limit": 100}
+            if page_token:
+                params["page_token"] = page_token
+
+            # Retry avec backoff exponentiel sur 429
+            for attempt in range(7):
+                r = requests.get(f"{base}/accounts", headers=headers, params=params, timeout=20)
+                if r.status_code == 429:
+                    retry_after = r.headers.get("Retry-After")
+                    wait = int(retry_after) + 2 if retry_after and retry_after.isdigit() \
+                           else min(2 ** attempt, 60)
+                    print(f"  ⏳ Front accounts 429 (page {page_count+1}), retry dans {wait}s…", flush=True)
+                    _time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                break
+            else:
+                raise Exception(f"Front accounts: 429 persistant après 7 tentatives (page {page_count+1})")
+
+            data  = r.json()
+            items = data.get("_results", [])
+            if not items:
+                break
+            all_accounts.extend(items)
+            page_count += 1
+            nxt = data.get("_pagination", {}).get("next", "")
+            if not nxt or "page_token=" not in nxt:
+                break
+            page_token = nxt.split("page_token=")[-1].split("&")[0]
+            _time.sleep(1.5)   # pause inter-page ≈ 40 req/min
+
+        _front_accounts_cache["data"]    = all_accounts
+        _front_accounts_cache["expires"] = now + timedelta(hours=4)
+        print(f"  ✅ Front accounts cache: {len(all_accounts)} comptes en {page_count} pages", flush=True)
+        return all_accounts
 
 
 def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
@@ -2020,7 +2046,8 @@ def _warmup():
         print(f"  ⚠ Warmup error: {e}", flush=True)
 
 import threading as _threading
-_front_tags_lock = _threading.Lock()   # évite la double-pagination (race condition warmup + requête)
+_front_tags_lock      = _threading.Lock()
+_front_accounts_lock  = _threading.Lock()
 _threading.Thread(target=_warmup, daemon=True).start()
 
 if __name__ == "__main__":
