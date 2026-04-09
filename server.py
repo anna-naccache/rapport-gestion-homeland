@@ -819,25 +819,24 @@ def _fetch_account_convs_via_contacts(base, headers, account_id, start_ts, end_t
 
     print(f"  👥 {len(contacts)} contacts pour account {account_id}", flush=True)
 
-    # 2. Pour chaque contact, récupérer ses conversations (filtrées par date)
-    all_conv_ids, convs = set(), []
-    for contact in contacts:
-        cid = contact.get("id")
-        if not cid:
-            continue
-        cpage, done = None, False
-        while len(convs) < 500 and not done:
+    # 2. Récupérer les conversations de chaque contact en parallèle (max 5 workers)
+    def _get_contact_convs(cid):
+        result, cpage, done = [], None, False
+        while not done:
             params = {"limit": 100}
             if cpage:
                 params["page_token"] = cpage
-            rv = requests.get(f"{base}/contacts/{cid}/conversations",
-                              headers=headers, params=params, timeout=20)
-            if rv.status_code == 429:
-                _time.sleep(int(rv.headers.get("Retry-After", "10")))
-                continue
-            if rv.status_code in (404, 403):
+            try:
+                rv = requests.get(f"{base}/contacts/{cid}/conversations",
+                                  headers=headers, params=params, timeout=20)
+                if rv.status_code == 429:
+                    _time.sleep(int(rv.headers.get("Retry-After", "10")))
+                    continue
+                if rv.status_code in (404, 403):
+                    break
+                rv.raise_for_status()
+            except Exception:
                 break
-            rv.raise_for_status()
             data  = rv.json()
             items = data.get("_results", [])
             if not items:
@@ -847,14 +846,24 @@ def _fetch_account_convs_via_contacts(base, headers, account_id, start_ts, end_t
                 if ts and ts < start_ts:
                     done = True
                     break
-                if ts and ts <= end_ts and c.get("id") not in all_conv_ids:
-                    convs.append(c)
-                    all_conv_ids.add(c.get("id"))
+                if ts and ts <= end_ts:
+                    result.append(c)
             nxt = data.get("_pagination", {}).get("next", "")
             if not nxt or "page_token=" not in nxt:
                 break
             cpage = nxt.split("page_token=")[-1].split("&")[0]
-        _time.sleep(0.3)   # politesse inter-contacts
+        return result
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    all_conv_ids, convs = set(), []
+    contact_ids = [c.get("id") for c in contacts if c.get("id")]
+    with _TPE(max_workers=5) as ex:
+        futures = {ex.submit(_get_contact_convs, cid): cid for cid in contact_ids}
+        for fut in futures:
+            for c in fut.result():
+                if c.get("id") not in all_conv_ids:
+                    convs.append(c)
+                    all_conv_ids.add(c.get("id"))
 
     return convs
 
@@ -2173,7 +2182,7 @@ def _warmup():
         else:
             print("  🔥 Warmup: scan bâtiments au démarrage…", flush=True)
             _run_id_scan(cfg)
-        # Pre-warm Front tags cache (évite les 200s de pagination à la première requête)
+        # Pre-warm Front tags + accounts en séquence (évite les 429 concurrents)
         if cfg.get("front"):
             print("  🔥 Warmup: chargement tags Front (cache 4h)…", flush=True)
             try:
@@ -2181,6 +2190,13 @@ def _warmup():
                 print(f"  ✅ {len(tags)} tags Front en cache", flush=True)
             except Exception as fe:
                 print(f"  ⚠ Front tags warmup: {fe}", flush=True)
+            # Comptes APRÈS les tags pour ne pas déclencher 429 concurrent
+            print("  🔥 Warmup: chargement comptes Front (cache 4h)…", flush=True)
+            try:
+                accounts = _get_all_front_accounts(cfg)
+                print(f"  ✅ {len(accounts)} comptes Front en cache", flush=True)
+            except Exception as ae:
+                print(f"  ⚠ Front accounts warmup: {ae}", flush=True)
     except Exception as e:
         print(f"  ⚠ Warmup error: {e}", flush=True)
 
