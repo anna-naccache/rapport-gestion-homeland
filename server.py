@@ -686,12 +686,49 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
         print(f"  ⚠ fetch_front_for_building({bid}): {e}")
         return {"convs": [], "csat": {}}
 
+_front_accounts_cache = {"data": None, "expires": datetime.min}
+
+def _get_all_front_accounts(cfg):
+    """Charge tous les comptes Front avec cache 4h (pagination côté serveur).
+    Le paramètre ?q= de l'API /accounts ne filtre pas par nom — on pagine tout
+    et on cherche localement.
+    """
+    global _front_accounts_cache
+    now = datetime.now()
+    if _front_accounts_cache["data"] is not None and now < _front_accounts_cache["expires"]:
+        return _front_accounts_cache["data"]
+
+    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    all_accounts, page_token = [], None
+    while len(all_accounts) < 10000:
+        params = {"limit": 100}
+        if page_token:
+            params["page_token"] = page_token
+        r = requests.get(f"{base}/accounts", headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data  = r.json()
+        items = data.get("_results", [])
+        if not items:
+            break
+        all_accounts.extend(items)
+        nxt = data.get("_pagination", {}).get("next", "")
+        if not nxt or "page_token=" not in nxt:
+            break
+        page_token = nxt.split("page_token=")[-1].split("&")[0]
+
+    _front_accounts_cache["data"]    = all_accounts
+    _front_accounts_cache["expires"] = now + timedelta(hours=4)
+    print(f"  ✅ Front accounts cache: {len(all_accounts)} comptes", flush=True)
+    return all_accounts
+
+
 def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
-    """Récupère CSAT Front en cherchant la copropriété par son nom de compte (account_name).
+    """Récupère CSAT Front en cherchant la copropriété par son nom de compte.
 
     Approche :
-      1. GET /accounts?q=<account_name>  →  trouver le compte correspondant
-      2. GET /accounts/{id}/conversations → conversations filtrées par date
+      1. Pagine tous les /accounts → recherche locale insensible à la casse
+      2. GET /accounts/{id}/conversations → filtre par date (created_at / last_message_at)
       3. front_csat_from_convs()          → extraire survey_rating / score
 
     Retourne : {"convs": [...], "csat": {...}, "account": {id, name}}
@@ -704,24 +741,27 @@ def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
     end_ts   = int(datetime.strptime(date_end,   "%Y-%m-%d").timestamp()) + 86399  # fin de journée
 
     try:
-        # ── 1. Trouver le compte par nom ──────────────────────────────────────
-        r = requests.get(f"{base}/accounts", headers=headers,
-                         params={"q": account_name, "limit": 20}, timeout=15)
-        r.raise_for_status()
-        accounts = r.json().get("_results", [])
-        if not accounts:
-            print(f"  ⚠ Front: aucun compte pour '{account_name}'", flush=True)
-            return {"convs": [], "csat": {}, "account": None}
+        # ── 1. Chercher le compte localement (recherche insensible casse + partielle) ──
+        all_accounts = _get_all_front_accounts(cfg)
+        name_up = account_name.upper().strip()
 
-        # Correspondance exacte prioritaire, sinon premier résultat
+        # Priorité : correspondance exacte → puis sous-chaîne
         account = None
-        name_up = account_name.upper()
-        for acc in accounts:
-            if acc.get("name", "").upper() == name_up:
+        for acc in all_accounts:
+            if (acc.get("name") or "").upper().strip() == name_up:
                 account = acc
                 break
         if not account:
-            account = accounts[0]
+            # Chercher les mots significatifs (> 3 caractères) du nom
+            words = [w for w in name_up.split() if len(w) > 3]
+            for acc in all_accounts:
+                acc_name = (acc.get("name") or "").upper()
+                if words and all(w in acc_name for w in words):
+                    account = acc
+                    break
+        if not account:
+            print(f"  ⚠ Front: aucun compte pour '{account_name}' parmi {len(all_accounts)}", flush=True)
+            return {"convs": [], "csat": {}, "account": None}
 
         print(f"  🏷 Front account: '{account.get('name')}' (id={account.get('id')})", flush=True)
 
@@ -1735,6 +1775,131 @@ def debug_csat(bid):
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/debug/front_accounts")
+def debug_front_accounts():
+    """Explore tous les comptes Front disponibles.
+    Params : ?q=ANATOLE (filtre côté serveur, insensible à la casse)
+             ?limit=50  (max comptes à retourner, défaut 50)
+    Pagine toutes les pages Front et filtre localement.
+    """
+    q        = (request.args.get("q") or "").strip().lower()
+    max_ret  = int(request.args.get("limit") or 50)
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        all_accounts, page_token, pages = [], None, 0
+        while len(all_accounts) < 5000:  # sécurité
+            params = {"limit": 100}
+            if page_token:
+                params["page_token"] = page_token
+            r = requests.get(f"{base}/accounts", headers=headers, params=params, timeout=20)
+            r.raise_for_status()
+            data  = r.json()
+            items = data.get("_results", [])
+            if not items:
+                break
+            all_accounts.extend(items)
+            pages += 1
+            nxt = data.get("_pagination", {}).get("next", "")
+            if not nxt or "page_token=" not in nxt:
+                break
+            page_token = nxt.split("page_token=")[-1].split("&")[0]
+
+        # Filtrage local
+        if q:
+            filtered = [a for a in all_accounts if q in (a.get("name") or "").lower()]
+        else:
+            filtered = all_accounts
+
+        return jsonify({
+            "total_accounts":   len(all_accounts),
+            "pages_fetched":    pages,
+            "filter_q":         q or "(none)",
+            "matched":          len(filtered),
+            "results":          [{"id": a.get("id"), "name": a.get("name")}
+                                 for a in filtered[:max_ret]],
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/debug/front_account_convs/<account_id>")
+def debug_front_account_convs(account_id):
+    """Conversations d'un compte Front avec leur metadata CSAT.
+    Params : ?limit=10 (défaut 10 premières convs)
+    """
+    limit = int(request.args.get("limit") or 10)
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        r = requests.get(f"{base}/accounts/{account_id}/conversations",
+                         headers=headers, params={"limit": limit}, timeout=20)
+        r.raise_for_status()
+        data  = r.json()
+        convs = data.get("_results", [])
+
+        # Pour chaque conv, récupérer les détails (metadata complète)
+        samples = []
+        for c in convs:
+            meta = c.get("metadata") or {}
+            sat  = meta.get("satisfaction") or {}
+            samples.append({
+                "id":            c.get("id"),
+                "subject":       (c.get("subject") or "")[:80],
+                "status":        c.get("status"),
+                "created_at":    c.get("created_at"),
+                "last_msg":      c.get("last_message_at"),
+                "metadata":      meta,
+                "satisfaction":  sat,
+                "survey_rating": sat.get("survey_rating"),
+                "all_keys":      list(c.keys()),
+            })
+
+        return jsonify({
+            "account_id":   account_id,
+            "total_in_page": len(convs),
+            "pagination":   data.get("_pagination"),
+            "conversations": samples,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/debug/front_conv/<conv_id>")
+def debug_front_conv(conv_id):
+    """Détails complets d'une conversation Front (tous les champs)."""
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        r = requests.get(f"{base}/conversations/{conv_id}", headers=headers, timeout=15)
+        r.raise_for_status()
+        c = r.json()
+        return jsonify({
+            "id":          c.get("id"),
+            "subject":     c.get("subject"),
+            "status":      c.get("status"),
+            "metadata":    c.get("metadata"),
+            "custom_fields": c.get("custom_fields"),
+            "created_at":  c.get("created_at"),
+            "all_keys":    list(c.keys()),
+            "full":        c,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/debug/front_csat_account")
 def debug_front_csat_account():
