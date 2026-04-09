@@ -749,6 +749,116 @@ def _get_all_front_accounts(cfg):
         return all_accounts
 
 
+def _fetch_account_convs_direct(base, headers, account_id, start_ts, end_ts):
+    """Tente GET /accounts/{id}/conversations (module CRM Front).
+    Retourne la liste de conversations filtrées, ou None si 404."""
+    import time as _time
+    convs, page_token, done = [], None, False
+    while len(convs) < 500 and not done:
+        params = {"limit": 100}
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            r = requests.get(f"{base}/accounts/{account_id}/conversations",
+                             headers=headers, params=params, timeout=20)
+            if r.status_code == 404:
+                return None        # endpoint non disponible (plan sans CRM)
+            if r.status_code == 429:
+                retry = r.headers.get("Retry-After", "10")
+                _time.sleep(int(retry) if retry.isdigit() else 10)
+                continue
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as he:
+            if he.response is not None and he.response.status_code == 404:
+                return None
+            raise
+        data  = r.json()
+        items = data.get("_results", [])
+        if not items:
+            break
+        for c in items:
+            ts = c.get("created_at") or c.get("last_message_at") or 0
+            if ts and ts < start_ts:
+                done = True
+                break
+            if ts and ts <= end_ts:
+                convs.append(c)
+        nxt = data.get("_pagination", {}).get("next", "")
+        if not nxt or "page_token=" not in nxt:
+            break
+        page_token = nxt.split("page_token=")[-1].split("&")[0]
+    return convs
+
+
+def _fetch_account_convs_via_contacts(base, headers, account_id, start_ts, end_ts):
+    """Fallback : compte → contacts → conversations (sans module CRM).
+    Retourne la liste de conversations filtrées."""
+    import time as _time
+
+    # 1. Récupérer les contacts du compte
+    contacts, page_token = [], None
+    while len(contacts) < 200:
+        params = {"limit": 100}
+        if page_token:
+            params["page_token"] = page_token
+        rc = requests.get(f"{base}/accounts/{account_id}/contacts",
+                          headers=headers, params=params, timeout=20)
+        if rc.status_code == 429:
+            _time.sleep(int(rc.headers.get("Retry-After", "10")))
+            continue
+        rc.raise_for_status()
+        data  = rc.json()
+        items = data.get("_results", [])
+        if not items:
+            break
+        contacts.extend(items)
+        nxt = data.get("_pagination", {}).get("next", "")
+        if not nxt or "page_token=" not in nxt:
+            break
+        page_token = nxt.split("page_token=")[-1].split("&")[0]
+
+    print(f"  👥 {len(contacts)} contacts pour account {account_id}", flush=True)
+
+    # 2. Pour chaque contact, récupérer ses conversations (filtrées par date)
+    all_conv_ids, convs = set(), []
+    for contact in contacts:
+        cid = contact.get("id")
+        if not cid:
+            continue
+        cpage, done = None, False
+        while len(convs) < 500 and not done:
+            params = {"limit": 100}
+            if cpage:
+                params["page_token"] = cpage
+            rv = requests.get(f"{base}/contacts/{cid}/conversations",
+                              headers=headers, params=params, timeout=20)
+            if rv.status_code == 429:
+                _time.sleep(int(rv.headers.get("Retry-After", "10")))
+                continue
+            if rv.status_code in (404, 403):
+                break
+            rv.raise_for_status()
+            data  = rv.json()
+            items = data.get("_results", [])
+            if not items:
+                break
+            for c in items:
+                ts = c.get("created_at") or c.get("last_message_at") or 0
+                if ts and ts < start_ts:
+                    done = True
+                    break
+                if ts and ts <= end_ts and c.get("id") not in all_conv_ids:
+                    convs.append(c)
+                    all_conv_ids.add(c.get("id"))
+            nxt = data.get("_pagination", {}).get("next", "")
+            if not nxt or "page_token=" not in nxt:
+                break
+            cpage = nxt.split("page_token=")[-1].split("&")[0]
+        _time.sleep(0.3)   # politesse inter-contacts
+
+    return convs
+
+
 def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
     """Récupère CSAT Front en cherchant la copropriété par son nom de compte.
 
@@ -792,29 +902,13 @@ def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
         print(f"  🏷 Front account: '{account.get('name')}' (id={account.get('id')})", flush=True)
 
         # ── 2. Conversations du compte filtrées par date ──────────────────────
-        convs, page_token, done = [], None, False
-        while len(convs) < 500 and not done:
-            params = {"limit": 100}
-            if page_token:
-                params["page_token"] = page_token
-            r2 = requests.get(f"{base}/accounts/{account['id']}/conversations",
-                              headers=headers, params=params, timeout=20)
-            r2.raise_for_status()
-            data  = r2.json()
-            items = data.get("_results", [])
-            if not items:
-                break
-            for c in items:
-                ts = c.get("created_at") or c.get("last_message_at") or 0
-                if ts and ts < start_ts:
-                    done = True   # dépassé la borne basse → stop pagination
-                    break
-                if ts <= end_ts:
-                    convs.append(c)
-            nxt = data.get("_pagination", {}).get("next", "")
-            if not nxt or "page_token=" not in nxt:
-                break
-            page_token = nxt.split("page_token=")[-1].split("&")[0]
+        # Essai 1 : GET /accounts/{id}/conversations (requiert module CRM Front)
+        convs = _fetch_account_convs_direct(base, headers, account["id"], start_ts, end_ts)
+
+        # Essai 2 : si 404 (module CRM absent), passer par les contacts du compte
+        if convs is None:
+            print(f"  ↩ Fallback contacts pour {account['id']}", flush=True)
+            convs = _fetch_account_convs_via_contacts(base, headers, account["id"], start_ts, end_ts)
 
         csat = front_csat_from_convs(convs)
         print(f"  ✅ Front account CSAT '{account.get('name')}': {len(convs)} convs, CSAT={csat.get('score')}", flush=True)
@@ -1855,6 +1949,51 @@ def debug_front_accounts():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/debug/front_account_contacts/<account_id>")
+def debug_front_account_contacts(account_id):
+    """Contacts d'un compte Front + premières conversations de chaque contact."""
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        # Contacts du compte
+        rc = requests.get(f"{base}/accounts/{account_id}/contacts",
+                          headers=headers, params={"limit": 10}, timeout=20)
+        contacts_status = rc.status_code
+        contacts = rc.json().get("_results", []) if rc.ok else []
+
+        # Premières conversations du 1er contact (pour voir la structure CSAT)
+        conv_samples = []
+        if contacts:
+            first_cid = contacts[0].get("id")
+            rv = requests.get(f"{base}/contacts/{first_cid}/conversations",
+                              headers=headers, params={"limit": 5}, timeout=20)
+            if rv.ok:
+                for c in rv.json().get("_results", []):
+                    sat = (c.get("metadata") or {}).get("satisfaction") or {}
+                    conv_samples.append({
+                        "id": c.get("id"),
+                        "subject": (c.get("subject") or "")[:60],
+                        "created_at": c.get("created_at"),
+                        "satisfaction": sat,
+                        "survey_rating": sat.get("survey_rating"),
+                    })
+
+        return jsonify({
+            "account_id":       account_id,
+            "contacts_status":  contacts_status,
+            "contacts_count":   len(contacts),
+            "contacts":         [{"id": c.get("id"), "name": c.get("name")} for c in contacts],
+            "conv_samples":     conv_samples,
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/debug/front_account_convs/<account_id>")
 def debug_front_account_convs(account_id):
     """Conversations d'un compte Front avec leur metadata CSAT.
@@ -2012,7 +2151,7 @@ def debug_building_parcels(bid):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "csat-account-v1"})
+    return jsonify({"status": "ok", "version": "csat-contacts-v2"})
 
 # ─────────────────────────────────────────────
 # START
