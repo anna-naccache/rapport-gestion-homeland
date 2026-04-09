@@ -254,28 +254,38 @@ def _extract_date(val):
 
 def is_closed(p):
     """Détecte si un projet HBO est clôturé/inactif.
-    Priorité : champ natif HBO 'projet_statut' ("inactif" = clôturé).
-    Fallback sur les autres champs possibles.
+
+    Règle stricte : on cherche explicitement "actif" pour dire "En cours".
+    Si le champ est absent ou inconnu → Clos par défaut (évite le bruit).
+    Valeurs HBO confirmées : status="actif" | "inactif"
     """
-    # Champ natif HBO (prioritaire)
-    ps = str(p.get("projet_statut") or "").lower().strip()
-    if ps in ("inactif", "inactive"):
-        return True
+    for field in ("projet_statut", "status", "state"):
+        val = p.get(field)
+        if val is None:
+            continue
+        s = _extract_str(val)   # gère str ET dict HBO {id, name, label…}
+        if not s:
+            continue
+        # Explicitement actif → En cours
+        if s in ("actif", "active", "en cours", "open", "in_progress", "in progress", "progress"):
+            return False
+        # Explicitement clos → Clos
+        if s in ("inactif", "inactive", "closed", "clôturé", "cloture",
+                 "terminé", "termine", "done", "completed",
+                 "archivé", "archive", "resolved", "clos"):
+            return True
+
     # Booléens explicites
+    if p.get("active") is True:
+        return False
     if p.get("active") is False:
         return True
     if p.get("closed") is True:
         return True
-    # Champ status (string ou objet)
-    st = _extract_str(p.get("status"))
-    if st in ("inactif", "inactive", "closed", "clôturé", "cloture", "terminé", "termine",
-               "done", "completed", "archivé", "archive", "resolved", "clos"):
-        return True
-    # Champ state
-    state = _extract_str(p.get("state"))
-    if state in ("inactif", "inactive", "closed", "done", "completed", "resolved"):
-        return True
-    return False
+
+    # Aucun champ de statut reconnu → Clos par défaut
+    # (les projets sans statut clair ne doivent pas polluer la liste "En cours")
+    return True
 
 def _extract_hbo_type(p):
     """Extrait le type de projet (string normalisée) depuis un champ string ou objet.
@@ -1139,8 +1149,8 @@ def get_building_data(bid):
             manager_name    = f_mgr.result()
             accountant_name = f_acct.result()
             assistant_name  = f_assist.result()
-            works       = f_works.result()
-            projs       = f_projs.result() or to_projects_list(works)
+            works       = f_works.result()   # réservé pour usage futur
+            projs       = f_projs.result() or []   # ne jamais mélanger avec works
             events      = f_events.result()
             incs        = f_incs.result()
             all_calls   = f_calls.result()
