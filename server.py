@@ -594,11 +594,17 @@ def _get_all_front_tags(cfg):
         return all_tags
 
 def front_convs_for_tag(cfg, tag_id, date_start, date_end):
-    """Conversations Front pour un tag, filtrées par date (pagination arrêtée si trop vieille)."""
+    """Conversations Front pour un tag avec activité dans la période.
+
+    L'API /tags/{id}/conversations trie par last_message_at DESC.
+    On s'arrête quand last_message_at < start_ts (aucune activité possible ensuite).
+    Bug corrigé : l'ancienne version utilisait created_at comme critère d'arrêt,
+    ce qui coupait les conversations créées avant la période mais actives pendant.
+    """
     base, token = cfg["front"]["base_url"], cfg["front"]["token"]
     headers  = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     start_ts = int(datetime.strptime(date_start, "%Y-%m-%d").timestamp())
-    end_ts   = int(datetime.strptime(date_end,   "%Y-%m-%d").timestamp())
+    end_ts   = int(datetime.strptime(date_end,   "%Y-%m-%d").timestamp()) + 86399
     convs, page_token, done = [], None, False
     while len(convs) < 1000 and not done:
         params = {"limit": 100}
@@ -613,11 +619,13 @@ def front_convs_for_tag(cfg, tag_id, date_start, date_end):
             if not items:
                 break
             for c in items:
-                ts = c.get("created_at") or c.get("last_message_at") or 0
-                if ts and ts < start_ts:
-                    done = True   # plus vieilles que la période → stop
+                # L'API trie par last_message_at DESC → utiliser ce champ pour l'arrêt
+                last_ts = c.get("last_message_at") or c.get("created_at") or 0
+                if last_ts and last_ts < start_ts:
+                    done = True   # Toutes les suivantes sont encore plus vieilles → stop
                     break
-                if not ts or ts <= end_ts:
+                # Inclure si la dernière activité est dans/avant la fin de fenêtre
+                if not last_ts or last_ts <= end_ts:
                     convs.append(c)
             nxt = data.get("_pagination", {}).get("next", "")
             if not nxt or "page_token=" not in nxt:
@@ -1043,7 +1051,12 @@ def find_front_tag_by_account_name(cfg, account_name):
 
 
 def _count_messages_in_conv(base, headers, conv_id, start_ts, end_ts):
-    """Compte les messages (inbound/outbound) dans [start_ts, end_ts] pour une conversation."""
+    """Compte les messages (inbound/outbound) dans [start_ts, end_ts] pour une conversation.
+
+    Messages Front triés du plus récent au plus ancien.
+    Bug corrigé : l'ancienne version s'arrêtait si found_any=False (pages de messages
+    plus récents que end_ts faisaient couper la pagination prématurément).
+    """
     import time as _time
     sent, received = 0, 0
     page_token = None
@@ -1065,19 +1078,20 @@ def _count_messages_in_conv(base, headers, conv_id, start_ts, end_ts):
         items = data.get("_results", [])
         if not items:
             break
-        found_any = False
+        hit_old = False
         for m in items:
             msg_ts = m.get("created_at") or 0
             if msg_ts and msg_ts < start_ts:
-                # Messages Front triés du plus récent au plus ancien → on peut arrêter
-                return sent, received
+                # Message plus vieux que la fenêtre → arrêt (les suivants sont encore plus vieux)
+                hit_old = True
+                break
             if msg_ts and msg_ts <= end_ts:
-                found_any = True
                 if m.get("is_inbound"):
                     received += 1
                 else:
                     sent += 1
-        if not found_any:
+            # msg_ts > end_ts → trop récent, on passe (ne pas arrêter la pagination)
+        if hit_old:
             break
         nxt = data.get("_pagination", {}).get("next", "")
         if not nxt or "page_token=" not in nxt:
@@ -2435,6 +2449,82 @@ def debug_front_email_count():
             return jsonify({"error": "Front non configuré"})
         result = fetch_front_email_count_by_account(cfg, account_name, date_start, date_end)
         return jsonify(result)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/debug/front_conv_raw")
+def debug_front_conv_raw():
+    """Inspecte le JSON brut d'une conversation Front pour trouver les champs CSAT disponibles.
+
+    Params GET :
+      ?conv_id=cnv_1iltrkiq   (ID de la conversation à inspecter)
+
+    Retourne l'objet complet de la conversation + les messages pour chercher le type 'survey'.
+    """
+    conv_id = request.args.get("conv_id", "cnv_1ilqop0i")  # défaut: conv avec Rating 1/5 connu
+    try:
+        cfg = load_config()
+        if not cfg.get("front"):
+            return jsonify({"error": "Front non configuré"})
+
+        base, token = cfg["front"]["base_url"], cfg["front"]["token"]
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        # 1. Objet conversation complet
+        r_conv = requests.get(f"{base}/conversations/{conv_id}", headers=headers, timeout=15)
+        r_conv.raise_for_status()
+        conv = r_conv.json()
+
+        # Extraire tous les champs de premier niveau + metadata complète
+        top_level_keys = list(conv.keys())
+        metadata = conv.get("metadata") or {}
+        satisfaction = metadata.get("satisfaction")
+
+        # 2. Messages de la conversation (chercher type 'survey' ou similaire)
+        r_msgs = requests.get(f"{base}/conversations/{conv_id}/messages",
+                              headers=headers, params={"limit": 50}, timeout=15)
+        r_msgs.raise_for_status()
+        msgs_raw = r_msgs.json().get("_results", [])
+
+        # Résumé des messages avec tous leurs champs de premier niveau
+        msg_summary = []
+        for m in msgs_raw:
+            msg_summary.append({
+                "id":          m.get("id"),
+                "type":        m.get("type"),
+                "created_at":  m.get("created_at"),
+                "is_inbound":  m.get("is_inbound"),
+                "body_preview": (m.get("body") or m.get("text") or "")[:120],
+                "all_keys":    list(m.keys()),
+                # Chercher champs CSAT potentiels
+                "satisfaction": m.get("satisfaction"),
+                "survey":       m.get("survey"),
+                "rating":       m.get("rating"),
+                "metadata":     m.get("metadata"),
+            })
+
+        return jsonify({
+            "conv_id":         conv_id,
+            "top_level_keys":  top_level_keys,
+            "status":          conv.get("status"),
+            "subject":         conv.get("subject"),
+            "created_at":      conv.get("created_at"),
+            "updated_at":      conv.get("updated_at"),
+            "metadata":        metadata,
+            "satisfaction_raw": satisfaction,
+            "tags":            [t.get("name") for t in (conv.get("tags") or [])],
+            "custom_fields":   conv.get("custom_fields"),
+            # Champs CSAT potentiels au niveau racine
+            "root_satisfaction": conv.get("satisfaction"),
+            "root_survey":       conv.get("survey"),
+            "root_rating":       conv.get("rating"),
+            "root_score":        conv.get("score"),
+            # Messages
+            "messages_count":  len(msgs_raw),
+            "messages":        msg_summary,
+        })
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 500
