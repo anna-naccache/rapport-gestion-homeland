@@ -713,8 +713,60 @@ def front_csat_from_convs(convs):
     })
     return result
 
+def fetch_hbo_csat(cfg, account_name, date_start, date_end):
+    """Récupère le CSAT directement depuis l'API HBO /front_csat.
+
+    Champs HBO : account_name, survey_rating, message_date
+    Filtre côté API sur account_name + message_date pour éviter de lire les 30k entrées.
+    Pagination sur les pages filtrées uniquement → rapide.
+    Retourne le même format que front_csat_from_convs().
+    """
+    if not cfg.get("hbo"):
+        return {}
+    try:
+        scores = []
+        page   = 1
+        while True:
+            data = hbo(cfg, "/front_csat", params={
+                "account_name":         account_name,   # filtre côté API
+                "message_date[after]":  date_start,
+                "message_date[before]": date_end,
+                "itemsPerPage": 200,
+                "page": page,
+            })
+            items = list_items(data)
+            if not items:
+                break
+            for item in items:
+                raw = item.get("survey_rating")
+                if raw is not None:
+                    try:
+                        scores.append(min(max(float(raw), 1), 5))
+                    except (TypeError, ValueError):
+                        pass
+            if len(items) < 200:
+                break
+            page += 1
+
+        result = {"count": len(scores), "survey_sent": len(scores), "no_response": 0}
+        if scores:
+            avg  = round(sum(scores) / len(scores), 1)
+            dist = Counter(round(s) for s in scores)
+            result.update({
+                "score":        avg,
+                "distribution": {i: dist.get(i, 0) for i in range(1, 6)},
+            })
+        print(f"  ✅ HBO CSAT '{account_name}': {len(scores)} notes, score={result.get('score')}", flush=True)
+        return result
+    except Exception as e:
+        print(f"  ⚠ fetch_hbo_csat('{account_name}'): {e}", flush=True)
+        return {}
+
+
 def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
-    """Récupère conversations + CSAT Front pour un bâtiment (via son tag)."""
+    """Récupère conversations + CSAT Front pour un bâtiment (via son tag).
+    CSAT vient maintenant de l'API HBO /front_csat (plus fiable que les tags).
+    """
     if not cfg.get("front"):
         return {"convs": [], "csat": {}}
     try:
@@ -723,7 +775,8 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
             print(f"  ⚠ Front: aucun tag trouvé pour building {bid}")
             return {"convs": [], "csat": {}}
         convs = front_convs_for_tag(cfg, tag["id"], date_start, date_end)
-        csat  = front_csat_from_convs(convs)
+        # CSAT via HBO directement (account_name = b_name)
+        csat  = fetch_hbo_csat(cfg, b_name, date_start, date_end) if cfg.get("hbo") else front_csat_from_convs(convs)
         print(f"  ✅ Front '{tag['name']}': {len(convs)} convs, CSAT={csat.get('score')}")
         return {"convs": convs, "csat": csat}
     except Exception as e:
@@ -925,99 +978,17 @@ def _fetch_account_convs_via_contacts(base, headers, account_id, start_ts, end_t
 
 
 def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
-    """Récupère CSAT Front en cherchant la copropriété par son nom de compte.
+    """Récupère CSAT via l'API HBO /front_csat (account_name + message_date).
 
-    Approche :
-      1. Pagine tous les /accounts → recherche locale insensible à la casse
-      2. GET /accounts/{id}/conversations → filtre par date (created_at / last_message_at)
-      3. front_csat_from_convs()          → extraire survey_rating / score
-
-    Retourne : {"convs": [...], "csat": {...}, "account": {id, name}}
+    Plus fiable que la détection via tags Front : source directe.
+    Retourne : {"convs": [], "csat": {...}, "account": {"name": account_name}}
     """
-    if not cfg.get("front"):
-        return {"convs": [], "csat": {}, "account": None}
-    base, token = cfg["front"]["base_url"], cfg["front"]["token"]
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    start_ts = int(datetime.strptime(date_start, "%Y-%m-%d").timestamp())
-    end_ts   = int(datetime.strptime(date_end,   "%Y-%m-%d").timestamp()) + 86399  # fin de journée
-
-    try:
-        # ── 1. Chercher le compte localement (recherche insensible casse + partielle) ──
-        all_accounts = _get_all_front_accounts(cfg)
-        name_up = account_name.upper().strip()
-
-        # Priorité : correspondance exacte → puis sous-chaîne
-        account = None
-        for acc in all_accounts:
-            if (acc.get("name") or "").upper().strip() == name_up:
-                account = acc
-                break
-        if not account:
-            # Chercher les mots significatifs (> 3 caractères) du nom
-            words = [w for w in name_up.split() if len(w) > 3]
-            for acc in all_accounts:
-                acc_name = (acc.get("name") or "").upper()
-                if words and all(w in acc_name for w in words):
-                    account = acc
-                    break
-        if not account:
-            print(f"  ⚠ Front: aucun compte pour '{account_name}' parmi {len(all_accounts)}", flush=True)
-            return {"convs": [], "csat": {}, "account": None}
-
-        print(f"  🏷 Front account: '{account.get('name')}' (id={account.get('id')})", flush=True)
-
-        # ── 2. Conversations du compte filtrées par date ──────────────────────
-        # Pour le CSAT on utilise updated_at + lookback 30j :
-        # une conversation créée le 29/03 notée le 03/04 doit être capturée.
-        CSAT_LOOKBACK = 30  # jours
-
-        # Essai 1 : GET /accounts/{id}/conversations (requiert module CRM Front)
-        convs = _fetch_account_convs_direct(base, headers, account["id"],
-                                             start_ts - CSAT_LOOKBACK * 86400, end_ts)
-        if convs is not None:
-            # Filtrer ici sur updated_at pour ne garder que celles actives pendant la fenêtre
-            convs = [c for c in convs
-                     if start_ts <= (c.get("updated_at") or c.get("created_at") or 0) <= end_ts]
-
-        # Essai 2 : si 404 (module CRM absent), passer par les contacts du compte
-        if convs is None:
-            print(f"  ↩ Fallback contacts pour {account['id']}", flush=True)
-            convs = _fetch_account_convs_via_contacts(
-                base, headers, account["id"], start_ts, end_ts,
-                use_updated_at=True, extra_lookback_days=CSAT_LOOKBACK
-            )
-
-        # ── 3. Compléter avec les conversations du TAG de la copropriété ─────
-        # Certaines convs (ex. envoyées par un contact non lié au compte Front)
-        # ne remontent pas via les contacts → on les récupère via le tag.
-        tag = find_front_tag_by_account_name(cfg, account.get("name", account_name))
-        if tag:
-            tag_start = (datetime.fromtimestamp(start_ts - CSAT_LOOKBACK * 86400)
-                         .strftime("%Y-%m-%d"))
-            tag_end   = (datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d"))
-            tag_convs = front_convs_for_tag(cfg, tag["id"], tag_start, tag_end)
-            # Filtrer sur updated_at puis dédupliquer
-            existing_ids = {c.get("id") for c in convs}
-            added = 0
-            for c in tag_convs:
-                active_ts = c.get("updated_at") or c.get("created_at") or 0
-                if start_ts <= active_ts <= end_ts and c.get("id") not in existing_ids:
-                    convs.append(c)
-                    existing_ids.add(c.get("id"))
-                    added += 1
-            if added:
-                print(f"  ➕ +{added} convs via tag '{tag.get('name')}'", flush=True)
-
-        csat = front_csat_from_convs(convs)
-        print(f"  ✅ Front account CSAT '{account.get('name')}': {len(convs)} convs, CSAT={csat.get('score')}", flush=True)
-        return {
-            "convs":   convs,
-            "csat":    csat,
-            "account": {"id": account.get("id"), "name": account.get("name")},
-        }
-    except Exception as e:
-        print(f"  ⚠ fetch_front_csat_by_account('{account_name}'): {e}", flush=True)
-        return {"convs": [], "csat": {}, "account": None}
+    csat = fetch_hbo_csat(cfg, account_name, date_start, date_end)
+    return {
+        "convs":   [],
+        "csat":    csat,
+        "account": {"name": account_name},
+    }
 
 
 # ── Front : comptage emails (messages) par copropriété ────────────
@@ -2524,6 +2495,50 @@ def debug_front_conv_raw():
             # Messages
             "messages_count":  len(msgs_raw),
             "messages":        msg_summary,
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/debug/hbo_csat")
+def debug_hbo_csat():
+    """Test de la route HBO /front_csat.
+
+    Params GET :
+      ?name=SDC+92300+18+RUE+GREFFULHE+-+5+RUE+JEAN+GABIN
+      ?date_start=2026-04-02
+      ?date_end=2026-04-08
+    """
+    account_name = request.args.get("name", "SDC 92300 18 RUE GREFFULHE - 5 RUE JEAN GABIN")
+    date_start   = request.args.get("date_start", "2026-04-02")
+    date_end     = request.args.get("date_end",   "2026-04-08")
+    try:
+        cfg = load_config()
+        if not cfg.get("hbo"):
+            return jsonify({"error": "HBO non configuré"})
+
+        # 1. Appel brut pour voir la structure
+        raw_page1 = hbo(cfg, "/front_csat", params={
+            "account_name":         account_name,
+            "message_date[after]":  date_start,
+            "message_date[before]": date_end,
+            "itemsPerPage": 10,
+            "page": 1,
+        })
+        items = list_items(raw_page1)
+
+        # 2. CSAT calculé
+        csat = fetch_hbo_csat(cfg, account_name, date_start, date_end)
+
+        return jsonify({
+            "account_name": account_name,
+            "date_range":   f"{date_start} → {date_end}",
+            "raw_total":    (raw_page1.get("hydra:totalItems") or raw_page1.get("total")
+                             if isinstance(raw_page1, dict) else len(items)),
+            "sample_keys":  list(items[0].keys()) if items else [],
+            "sample":       items[:3],
+            "csat":         csat,
         })
     except Exception as e:
         import traceback; traceback.print_exc()
