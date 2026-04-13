@@ -714,23 +714,30 @@ def front_csat_from_convs(convs):
     return result
 
 def fetch_hbo_csat(cfg, account_name, date_start, date_end):
-    """Récupère le CSAT directement depuis l'API HBO /front_csat.
+    """Récupère le CSAT depuis l'API HBO GET /enum/front_csats.
 
-    Champs HBO : account_name, survey_rating, message_date
-    Filtre côté API sur account_name + message_date pour éviter de lire les 30k entrées.
-    Pagination sur les pages filtrées uniquement → rapide.
+    Schéma HBO (camelCase) :
+      accountName, surveyRating, surveyComment, messageDate,
+      contactName, contactHandle, attributedTo, inbox
+
+    Filtre : tente accountName + messageDate[after/before] côté API.
+    Si les filtres ne sont pas supportés → filtre en local.
     Retourne le même format que front_csat_from_convs().
     """
     if not cfg.get("hbo"):
         return {}
     try:
+        start_dt = datetime.strptime(date_start, "%Y-%m-%d")
+        end_dt   = datetime.strptime(date_end,   "%Y-%m-%d")
+        name_up  = account_name.upper().strip()
+
         scores = []
         page   = 1
         while True:
-            data = hbo(cfg, "/front_csat", params={
-                "account_name":         account_name,   # filtre côté API
-                "message_date[after]":  date_start,
-                "message_date[before]": date_end,
+            data = hbo(cfg, "/enum/front_csats", params={
+                "accountName":             account_name,
+                "messageDate[after]":      date_start,
+                "messageDate[before]":     date_end,
                 "itemsPerPage": 200,
                 "page": page,
             })
@@ -738,7 +745,19 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
             if not items:
                 break
             for item in items:
-                raw = item.get("survey_rating")
+                # Filtre local en cas d'absence de filtre API
+                an = (item.get("accountName") or "").upper().strip()
+                if an and an != name_up:
+                    continue
+                md = item.get("messageDate") or ""
+                if md:
+                    try:
+                        item_dt = datetime.fromisoformat(md[:10])
+                        if not (start_dt <= item_dt <= end_dt):
+                            continue
+                    except ValueError:
+                        pass
+                raw = item.get("surveyRating")
                 if raw is not None:
                     try:
                         scores.append(min(max(float(raw), 1), 5))
@@ -2519,10 +2538,10 @@ def debug_hbo_csat():
             return jsonify({"error": "HBO non configuré"})
 
         # 1. Appel brut pour voir la structure
-        raw_page1 = hbo(cfg, "/front_csat", params={
-            "account_name":         account_name,
-            "message_date[after]":  date_start,
-            "message_date[before]": date_end,
+        raw_page1 = hbo(cfg, "/enum/front_csats", params={
+            "accountName":         account_name,
+            "messageDate[after]":  date_start,
+            "messageDate[before]": date_end,
             "itemsPerPage": 10,
             "page": 1,
         })

@@ -27,38 +27,66 @@ TOKEN   = r.json()["token"]
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 print("✅ Connecté\n")
 
+# ─── Découverte : tester les variantes de la route ──────────────────────────
+print("🔍 Recherche de la bonne route...\n")
+VARIANTS = [
+    "/front_csat", "/front-csat", "/frontCsat", "/front_csats",
+    "/front_csat_ratings", "/csat", "/csats", "/survey_ratings",
+    "/satisfaction_ratings", "/front_satisfaction", "/satisfaction",
+    "/ratings", "/notes_satisfaction", "/avis_csat",
+    "/v1/front_csat", "/v2/front_csat",
+    "/building/front_csat", "/copropriete/front_csat",
+    "/front_csat/list", "/api/front_csat",
+    "/front_survey", "/front_surveys", "/survey", "/surveys",
+]
+for v in VARIANTS:
+    try:
+        r = requests.get(f"{HBO_BASE}{v}", headers=HEADERS,
+                         params={"itemsPerPage": 1}, timeout=8)
+        if r.status_code != 404:
+            print(f"  ✅ {v} → {r.status_code} : {r.text[:120]}")
+    except Exception as e:
+        pass
+print()
+
 # ─── Test direct de la route /front_csat ─────────────────────────────────────
 ACCOUNT_NAME = "SDC 92300 18 RUE GREFFULHE - 5 RUE JEAN GABIN"
 DATE_START   = "2026-04-02"
 DATE_END     = "2026-04-08"
 
-print(f"🔍 Test route /front_csat")
+print(f"🔍 Test route /enum/front_csats")
 print(f"   Copropriété : {ACCOUNT_NAME}")
 print(f"   Période     : {DATE_START} → {DATE_END}\n")
 
-# Page 1 sans filtre pour voir la structure
-r0 = requests.get(f"{HBO_BASE}/front_csat", headers=HEADERS,
+# Page 1 sans filtre pour voir la structure + total
+r0 = requests.get(f"{HBO_BASE}/enum/front_csats", headers=HEADERS,
                   params={"itemsPerPage": 3}, timeout=15)
-print(f"GET /front_csat → {r0.status_code}")
+print(f"GET /enum/front_csats → {r0.status_code}")
 if r0.ok:
     d0 = r0.json()
     items0 = (d0.get("hydra:member") or d0.get("member") or
-              d0.get("data") or d0.get("items") or d0 if isinstance(d0, list) else [])
+              d0.get("data") or d0.get("items") or (d0 if isinstance(d0, list) else []))
     total = d0.get("hydra:totalItems") or d0.get("total") or "?"
-    print(f"Total enregistrements : {total}")
+    print(f"Total enregistrements (toutes copros) : {total}")
     if items0:
         print(f"Champs disponibles : {list(items0[0].keys())}")
         print(f"Exemple :\n{json.dumps(items0[0], indent=2, ensure_ascii=False)}\n")
+else:
+    print(f"Erreur : {r0.text[:300]}")
 
-# Test avec filtre account_name + date
-print(f"─── Filtre account_name + date ───")
+# Test avec filtres camelCase
+print(f"─── Filtre accountName + messageDate ───")
+from datetime import datetime as _dt
+start_dt = _dt.strptime(DATE_START, "%Y-%m-%d")
+end_dt   = _dt.strptime(DATE_END,   "%Y-%m-%d")
+name_up  = ACCOUNT_NAME.upper().strip()
 scores = []
 page = 1
 while True:
-    r = requests.get(f"{HBO_BASE}/front_csat", headers=HEADERS, params={
-        "account_name":         ACCOUNT_NAME,
-        "message_date[after]":  DATE_START,
-        "message_date[before]": DATE_END,
+    r = requests.get(f"{HBO_BASE}/enum/front_csats", headers=HEADERS, params={
+        "accountName":         ACCOUNT_NAME,
+        "messageDate[after]":  DATE_START,
+        "messageDate[before]": DATE_END,
         "itemsPerPage": 200,
         "page": page,
     }, timeout=15)
@@ -72,11 +100,26 @@ while True:
     print(f"  {len(items)} résultats cette page")
     if items and page == 1:
         print(f"  Exemple : {json.dumps(items[0], indent=2, ensure_ascii=False)}")
+    matched = 0
     for item in items:
-        raw = item.get("survey_rating")
-        if raw is not None:
-            try: scores.append(float(raw))
+        # Filtre local aussi (au cas où les params API ne filtrent pas)
+        an = (item.get("accountName") or "").upper().strip()
+        if an and an != name_up:
+            continue
+        md = item.get("messageDate") or ""
+        if md:
+            try:
+                item_dt = _dt.fromisoformat(md[:10])
+                if not (start_dt <= item_dt <= end_dt):
+                    continue
             except: pass
+        raw = item.get("surveyRating")
+        if raw is not None:
+            try:
+                scores.append(float(raw))
+                matched += 1
+            except: pass
+    print(f"  → {matched} notes retenues après filtre local")
     if len(items) < 200:
         break
     page += 1
