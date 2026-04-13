@@ -140,28 +140,125 @@ def list_items(data):
 # RINGOVER
 # ─────────────────────────────────────────────
 
-def ringover_calls(cfg, date_start, date_end, building_name="", building_tags=None, max_calls=2000):
-    """Récupère les appels Ringover sur la période (plafonné à max_calls)."""
+_ringover_tags_cache = {"data": None, "expires": datetime.min}
+
+def ringover_get_tags(cfg):
+    """Récupère tous les tags Ringover avec cache 4h.
+    Retourne liste de {tag_id, tag_name}.
+    """
+    global _ringover_tags_cache
+    now = datetime.now()
+    if _ringover_tags_cache["data"] is not None and now < _ringover_tags_cache["expires"]:
+        return _ringover_tags_cache["data"]
     base, api_key = cfg["ringover"]["base_url"], cfg["ringover"]["api_key"]
-    calls, offset = [], 0
-    while len(calls) < max_calls:
-        try:
-            r = requests.get(f"{base}/calls",
-                headers={"Authorization": api_key},
-                params={"limit_count": 100, "limit_offset": offset,
-                        "period_start": f"{date_start}T00:00:00",
-                        "period_end":   f"{date_end}T23:59:59"},
-                timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            batch = data.get("call_list", data.get("callList", data.get("calls", [])))
-            if not batch: break
-            calls.extend(batch)
-            if len(batch) < 100: break
-            offset += 100
-        except Exception as e:
-            print(f"  ⚠ Ringover: {e}"); break
-    return calls
+    try:
+        r = requests.get(f"{base}/tags", headers={"Authorization": api_key}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        tags = data.get("tag_list", data.get("tags", data if isinstance(data, list) else []))
+        _ringover_tags_cache["data"]    = tags
+        _ringover_tags_cache["expires"] = now + timedelta(hours=4)
+        print(f"  📋 Ringover tags: {len(tags)} tags chargés", flush=True)
+        return tags
+    except Exception as e:
+        print(f"  ⚠ Ringover GET /tags: {e}", flush=True)
+        return []
+
+def ringover_find_tag_for_building(cfg, building_name):
+    """Trouve le tag Ringover correspondant à un bâtiment (correspondance partielle du nom)."""
+    tags = ringover_get_tags(cfg)
+    name_up = building_name.upper().strip()
+    # Essai 1 : correspondance exacte
+    for t in tags:
+        if (t.get("tag_name") or t.get("name") or "").upper().strip() == name_up:
+            return t
+    # Essai 2 : mots clés significatifs (adresse)
+    words = [w for w in name_up.split() if len(w) > 3 and not w.isdigit()]
+    if words:
+        for t in tags:
+            tname = (t.get("tag_name") or t.get("name") or "").upper()
+            if all(w in tname for w in words[:3]):
+                return t
+    # Essai 3 : premier mot de longueur > 4 dans le nom
+    for t in tags:
+        tname = (t.get("tag_name") or t.get("name") or "").upper()
+        if words and words[0] in tname:
+            return t
+    return None
+
+def ringover_calls(cfg, date_start, date_end, building_name="", building_tags=None, max_calls=5000):
+    """Récupère les appels Ringover sur la période, filtrés par tag de bâtiment.
+
+    L'API impose max 15 jours entre start_date et end_date → découpe en tranches.
+    Filtre par tag_id si building_name est fourni (1 tag = 1 immeuble).
+    Retourne uniquement les appels avec le bon tag, ou tous si pas de tag trouvé.
+    """
+    if not cfg.get("ringover"):
+        return []
+    base, api_key = cfg["ringover"]["base_url"], cfg["ringover"]["api_key"]
+    headers = {"Authorization": api_key}
+
+    # Trouver le tag du bâtiment
+    tag_id = None
+    if building_name and cfg.get("ringover"):
+        tag = ringover_find_tag_for_building(cfg, building_name)
+        if tag:
+            tag_id = tag.get("tag_id") or tag.get("id")
+            print(f"  🏷 Ringover tag trouvé: '{tag.get('tag_name') or tag.get('name')}' (id={tag_id})", flush=True)
+        else:
+            print(f"  ⚠ Ringover: aucun tag pour '{building_name}'", flush=True)
+
+    # Découper la période en tranches ≤ 15 jours
+    from datetime import date as _date
+    start = datetime.strptime(date_start, "%Y-%m-%d")
+    end   = datetime.strptime(date_end,   "%Y-%m-%d")
+    MAX_DAYS = 14  # marge de sécurité sous les 15j
+    chunks = []
+    cur = start
+    while cur <= end:
+        chunk_end = min(cur + timedelta(days=MAX_DAYS), end)
+        chunks.append((cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        cur = chunk_end + timedelta(days=1)
+
+    all_calls = []
+    for chunk_start, chunk_end in chunks:
+        offset = 0
+        while len(all_calls) < max_calls:
+            try:
+                r = requests.get(f"{base}/calls",
+                    headers=headers,
+                    params={
+                        "start_date":   f"{chunk_start}T00:00:00.000Z",
+                        "end_date":     f"{chunk_end}T23:59:59.999Z",
+                        "limit_count":  100,
+                        "limit_offset": offset,
+                    },
+                    timeout=20)
+                r.raise_for_status()
+                data  = r.json()
+                batch = data.get("call_list", data.get("callList", data.get("calls", [])))
+                if not batch:
+                    break
+                # Filtrer par tag_id si connu
+                if tag_id is not None:
+                    batch = [
+                        c for c in batch
+                        if any(
+                            str(t.get("tag_id") or t.get("id") or "") == str(tag_id)
+                            for t in (c.get("tags") or [])
+                        )
+                    ]
+                all_calls.extend(batch)
+                raw_batch_size = len(data.get("call_list", data.get("callList", data.get("calls", []))))
+                if raw_batch_size < 100:
+                    break
+                offset += 100
+            except Exception as e:
+                print(f"  ⚠ Ringover [{chunk_start}→{chunk_end}]: {e}", flush=True)
+                break
+
+    print(f"  📞 Ringover: {len(all_calls)} appels (tag_id={tag_id}, {date_start}→{date_end})", flush=True)
+    return all_calls
 
 # ─────────────────────────────────────────────
 # FRONT
@@ -458,32 +555,53 @@ def get_service_for_call(call, admin_email_map):
             return svc
     return get_call_service_from_tags(call)
 
+def _call_direction(c):
+    """Normalise la direction d'un appel Ringover → 'inbound' ou 'outbound'."""
+    d = str(c.get("direction") or c.get("type") or "").upper()
+    return "inbound" if d in ("IN", "INBOUND", "INCOMING", "ANSWERED") else "outbound"
+
+def _call_duration(c):
+    """Durée de conversation en secondes (sans la sonnerie)."""
+    return int(c.get("incall_duration") or c.get("duration") or c.get("duration_seconds") or 0)
+
+def _call_start(c):
+    """Date/heure de début de l'appel (ISO string)."""
+    return (c.get("start_time") or c.get("startedAt") or c.get("started_at")
+            or c.get("start_date") or c.get("date") or "")
+
 def process_calls_v3(calls, admin_email_map=None):
-    total    = len(calls)
-    in_cnt   = sum(1 for c in calls if str(c.get("direction") or c.get("type") or "in").lower()
-                   in ("in", "inbound", "incoming"))
-    out_cnt  = total - in_cnt
-    # incall_duration = durée réelle de conversation (sans sonnerie)
-    dur_sec  = [int(c.get("incall_duration") or c.get("duration") or c.get("duration_seconds") or 0)
-                for c in calls]
-    total_sec = sum(dur_sec)
-    avg_dur   = (total_sec / len(dur_sec)) if dur_sec else 0
+    """Agrège les appels Ringover pour le rapport.
+
+    Champs Ringover utilisés : call_id, direction (IN/OUT), start_time,
+    incall_duration, user_id, tags, status, from_number, to_number.
+    """
+    total     = len(calls)
+    in_cnt    = sum(1 for c in calls if _call_direction(c) == "inbound")
+    out_cnt   = total - in_cnt
+    dur_list  = [_call_duration(c) for c in calls]
+    total_sec = sum(dur_list)
+    avg_dur   = (total_sec / len(dur_list)) if dur_list else 0
 
     by_month   = defaultdict(int)
     by_service = defaultdict(lambda: {"count": 0, "duration_seconds": 0})
+    answered   = sum(1 for c in calls if str(c.get("status") or "").upper() == "ANSWERED"
+                     or _call_duration(c) > 0)
+    missed     = total - answered
+
     for c in calls:
-        ds = c.get("startedAt") or c.get("started_at") or c.get("date") or ""
+        ds = _call_start(c)
         if ds:
             by_month[ds[:7]] += 1
         svc = get_service_for_call(c, admin_email_map or {})
-        dur = int(c.get("incall_duration") or c.get("duration") or c.get("duration_seconds") or 0)
         by_service[svc]["count"]            += 1
-        by_service[svc]["duration_seconds"] += dur
+        by_service[svc]["duration_seconds"] += _call_duration(c)
 
     return {
         "total":                total,
         "inbound":              in_cnt,
         "outbound":             out_cnt,
+        "answered":             answered,
+        "missed":               missed,
         "avg_duration_seconds": round(avg_dur),
         "total_duration_hours": round(total_sec / 3600, 1),
         "by_month":             dict(sorted(by_month.items())),
@@ -1674,7 +1792,7 @@ def get_building_data(bid):
             f_projs     = ex.submit(fetch_projects_hbo, cfg, bid)
             f_events    = ex.submit(_fetch_building_events, bid)
             f_incs      = ex.submit(lambda: list_items(hbo(cfg, "/incidents",  {"building_id": bid})))
-            f_calls     = ex.submit(ringover_calls, cfg, date_start, date_end)
+            f_calls     = ex.submit(ringover_calls, cfg, date_start, date_end, b_name)
             f_front     = ex.submit(fetch_front_for_building, cfg, bid, b_name, date_start, date_end)
             f_admins    = ex.submit(get_admin_users_map, cfg)
             f_admin_ids = ex.submit(get_admin_users_id_map, cfg)

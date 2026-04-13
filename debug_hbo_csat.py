@@ -49,10 +49,44 @@ for v in VARIANTS:
         pass
 print()
 
+# ─── Test endpoint individuel + filtres disponibles ─────────────────────────
+print("🔍 Vérification champs de l'item individuel + filtres...\n")
+
+# 1. Récupérer la première page pour avoir un ID
+r_p1 = requests.get(f"{HBO_BASE}/enum/front_csats", headers=HEADERS, params={"itemsPerPage": 1}, timeout=10)
+if r_p1.ok:
+    first_items = r_p1.json() if isinstance(r_p1.json(), list) else []
+    if first_items:
+        first_id = first_items[0]["id"]
+        # Fetch item par ID
+        r_item = requests.get(f"{HBO_BASE}/enum/front_csats/{first_id}", headers=HEADERS, timeout=10)
+        print(f"GET /enum/front_csats/{first_id} → {r_item.status_code}")
+        if r_item.ok:
+            print(f"Champs item individuel : {list(r_item.json().keys())}")
+            print(json.dumps(r_item.json(), indent=2, ensure_ascii=False))
+
+# 2. Tester différents filtres
+print("\n─── Test filtres disponibles ───")
+filter_tests = [
+    {"accountName": "SDC 92300 18 RUE GREFFULHE - 5 RUE JEAN GABIN", "itemsPerPage": 5},
+    {"account_name": "SDC 92300 18 RUE GREFFULHE - 5 RUE JEAN GABIN", "itemsPerPage": 5},
+    {"account": "SDC 92300 18 RUE GREFFULHE - 5 RUE JEAN GABIN", "itemsPerPage": 5},
+    {"attributedTo": "anaccache", "itemsPerPage": 5},
+    {"inbox": "SDC 92300", "itemsPerPage": 5},
+]
+for ft in filter_tests:
+    r = requests.get(f"{HBO_BASE}/enum/front_csats", headers=HEADERS, params=ft, timeout=10)
+    d = r.json()
+    items = d if isinstance(d, list) else (d.get("hydra:member") or [])
+    print(f"  {list(ft.keys())[0]}={list(ft.values())[0][:30]} → {r.status_code}, {len(items)} résultats")
+    if items and len(items) < 10:
+        print(f"    → {json.dumps(items[0], ensure_ascii=False)}")
+
+print()
 # ─── Test direct de la route /front_csat ─────────────────────────────────────
 ACCOUNT_NAME = "SDC 92300 18 RUE GREFFULHE - 5 RUE JEAN GABIN"
-DATE_START   = "2026-04-02"
-DATE_END     = "2026-04-08"
+DATE_START   = "2024-01-01"
+DATE_END     = "2026-04-13"
 
 print(f"🔍 Test route /enum/front_csats")
 print(f"   Copropriété : {ACCOUNT_NAME}")
@@ -64,9 +98,8 @@ r0 = requests.get(f"{HBO_BASE}/enum/front_csats", headers=HEADERS,
 print(f"GET /enum/front_csats → {r0.status_code}")
 if r0.ok:
     d0 = r0.json()
-    items0 = (d0.get("hydra:member") or d0.get("member") or
-              d0.get("data") or d0.get("items") or (d0 if isinstance(d0, list) else []))
-    total = d0.get("hydra:totalItems") or d0.get("total") or "?"
+    items0 = d0 if isinstance(d0, list) else (d0.get("hydra:member") or d0.get("member") or d0.get("data") or d0.get("items") or [])
+    total = len(items0) if isinstance(d0, list) else (d0.get("hydra:totalItems") or d0.get("total") or "?")
     print(f"Total enregistrements (toutes copros) : {total}")
     if items0:
         print(f"Champs disponibles : {list(items0[0].keys())}")
@@ -95,8 +128,7 @@ while True:
         print(f"  Erreur : {r.text[:200]}")
         break
     d = r.json()
-    items = (d.get("hydra:member") or d.get("member") or
-             d.get("data") or d.get("items") or (d if isinstance(d, list) else []))
+    items = d if isinstance(d, list) else (d.get("hydra:member") or d.get("member") or d.get("data") or d.get("items") or [])
     print(f"  {len(items)} résultats cette page")
     if items and page == 1:
         print(f"  Exemple : {json.dumps(items[0], indent=2, ensure_ascii=False)}")
@@ -125,7 +157,7 @@ while True:
     page += 1
 
 print(f"\n{'='*60}")
-print(f"  Notes trouvées : {len(scores)}")
+print(f"  Notes trouvées (TOUTES COPROS, filtre accountName KO) : {len(scores)}")
 if scores:
     avg = round(sum(scores)/len(scores), 2)
     print(f"  Score moyen   : {avg}/5")
