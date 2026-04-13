@@ -795,7 +795,7 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
             return {"convs": [], "csat": {}}
         convs = front_convs_for_tag(cfg, tag["id"], date_start, date_end)
         # CSAT via HBO directement (account_name = b_name)
-        csat  = fetch_hbo_csat(cfg, b_name, date_start, date_end) if cfg.get("hbo") else front_csat_from_convs(convs)
+        csat  = front_csat_from_convs(convs)  # CSAT via tags Front (accountName absent de l'API HBO)
         print(f"  ✅ Front '{tag['name']}': {len(convs)} convs, CSAT={csat.get('score')}")
         return {"convs": convs, "csat": csat}
     except Exception as e:
@@ -997,14 +997,21 @@ def _fetch_account_convs_via_contacts(base, headers, account_id, start_ts, end_t
 
 
 def fetch_front_csat_by_account(cfg, account_name, date_start, date_end):
-    """Récupère CSAT via l'API HBO /front_csat (account_name + message_date).
+    """Récupère CSAT via le tag Front de la copropriété.
 
-    Plus fiable que la détection via tags Front : source directe.
-    Retourne : {"convs": [], "csat": {...}, "account": {"name": account_name}}
+    Note : l'API HBO /enum/front_csats ne retourne pas accountName dans sa réponse
+    → impossible de filtrer par copropriété côté HBO pour l'instant.
+    On utilise les conversations Front tagguées (amélioré : filtre last_message_at).
     """
-    csat = fetch_hbo_csat(cfg, account_name, date_start, date_end)
+    if not cfg.get("front"):
+        return {"convs": [], "csat": {}, "account": None}
+    tag = find_front_tag_by_account_name(cfg, account_name)
+    if not tag:
+        return {"convs": [], "csat": {}, "account": None}
+    convs = front_convs_for_tag(cfg, tag["id"], date_start, date_end)
+    csat  = front_csat_from_convs(convs)
     return {
-        "convs":   [],
+        "convs":   convs,
         "csat":    csat,
         "account": {"name": account_name},
     }
@@ -1635,13 +1642,28 @@ def get_building_data(bid):
             return ev
 
         def _fetch_parcels(bid_):
-            """Essaie /building_parcels/{bid} pour récupérer nbLotsMain."""
+            """Compte les lots depuis /building_parcels/{bid}.
+            Retourne dict avec lots_total, lots_habitation (apparts+studios), lots_detail.
+            """
             data = hbo(cfg, f"/building_parcels/{bid_}")
             if data is None:
                 return {}
-            if isinstance(data, list) and data:
-                return data[0] if isinstance(data[0], dict) else {}
-            return data if isinstance(data, dict) else {}
+            items = data if isinstance(data, list) else list_items(data)
+            if not items:
+                return {}
+            # Compter par type
+            HABITATION = {"appartement", "studio", "duplex", "triplex", "loft", "chambre"}
+            from collections import Counter as _Counter
+            type_counts = _Counter((p.get("type") or "").strip() for p in items)
+            lots_habitation = sum(
+                v for t, v in type_counts.items()
+                if any(h in t.lower() for h in HABITATION)
+            )
+            return {
+                "lots_total":      len(items),
+                "lots_habitation": lots_habitation,
+                "lots_detail":     dict(type_counts),
+            }
 
         # Tout en parallèle : HBO + Ringover + Front + admin maps
         with ThreadPoolExecutor(max_workers=15) as ex:
@@ -1724,24 +1746,19 @@ def get_building_data(bid):
                       b.get("managedSince") or b.get("dateCreation") or "")
         if created_at: created_at = created_at[:10]
 
-        # Lots : /building_parcels/{bid} → nbLotsMain prioritaire (confirmé via session web)
-        # Fallback : /copropriete/{bid} → copropriété_lotsppx
-        # Fallback final : /building/{bid} (en général absent de l'API JWT)
+        # Lots : /building_parcels/{bid} → compter les lots d'habitation (apparts + studios)
+        # Fallback si building_parcels échoue : /copropriete ou /building
         lots_count = (
-            # /building_parcels (essai JWT)
-            (parcels.get("nbLotsMain") or parcels.get("nbLotsTotal")
-             or parcels.get("nb_lots_main") or parcels.get("lotsMain"))
-            # /copropriete
+            parcels.get("lots_habitation")              # nouveau calcul depuis parcels list
+            or parcels.get("lots_total")               # fallback total
             or copro.get("copropriété_lotsppx") or copro.get("copropriete_lotsppx")
             or copro.get("lotsppx") or copro.get("lots_ppx") or copro.get("lots")
             or copro.get("nbLotsMain") or copro.get("nbLotsTotal")
-            # /building (en général vide côté JWT)
             or b.get("nbLotsMain") or b.get("nbLotsTotal")
-            or b.get("copropriété_lotsppx") or b.get("copropriete_lotsppx")
             or b.get("lotsppx") or b.get("lots") or b.get("lotsCount")
             or b.get("lotsPrincipaux") or b.get("numberOfLots") or b.get("nb_lots") or 0
         )
-        print(f"  🏢 lots_count={lots_count} (parcels={list(parcels.keys())[:5]}, copro_keys={list(copro.keys())[:10]})", flush=True)
+        print(f"  🏢 lots_count={lots_count} parcels_detail={parcels.get('lots_detail')}", flush=True)
 
         result = {
             "building": {
