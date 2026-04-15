@@ -224,9 +224,11 @@ def ringover_calls(cfg, date_start, date_end, building_name="", bid=None, buildi
         tag = ringover_find_tag_for_building(cfg, building_name, bid=bid)
         if tag:
             tag_id = tag.get("tag_id") or tag.get("id")
-            print(f"  🏷 Ringover tag trouvé: '{tag.get('tag_name') or tag.get('name')}' (id={tag_id})", flush=True)
+            print(f"  🏷 Ringover tag trouvé: '{tag.get('name') or tag.get('tag_name')}' (id={tag_id})", flush=True)
         else:
-            print(f"  ⚠ Ringover: aucun tag pour bid={bid} / '{building_name}'", flush=True)
+            # Sans tag on ne peut pas filtrer → on retourne vide pour ne pas tout charger
+            print(f"  ⚠ Ringover: aucun tag pour bid={bid} → retour vide", flush=True)
+            return []
 
     # Découper la période en tranches ≤ 15 jours
     from datetime import date as _date
@@ -882,6 +884,7 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
         page   = 1
         total_seen = 0
         stop_early = False
+        MAX_PAGES  = 20   # sécurité : ne pas dépasser 20k entrées (20 × 1000)
         # Pas de filtre API sur accountName ni messageDate (non supportés).
         # On filtre entièrement en local :
         #   - accountName doit correspondre exactement (champ absent = null = exclu)
@@ -921,7 +924,7 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
                         scores.append(min(max(float(raw), 1), 5))
                     except (TypeError, ValueError):
                         pass
-            if len(items) < 1000:
+            if len(items) < 1000 or page >= MAX_PAGES:
                 break
             page += 1
 
@@ -1853,19 +1856,26 @@ def get_building_data(bid):
             f_copro     = ex.submit(lambda: hbo(cfg, f"/copropriete/{bid}") or {})
             f_parcels   = ex.submit(_fetch_parcels, bid)
 
-            manager_name    = f_mgr.result()
-            accountant_name = f_acct.result()
-            assistant_name  = f_assist.result()
-            works       = f_works.result()   # réservé pour usage futur
-            projs       = f_projs.result() or []   # ne jamais mélanger avec works
-            events      = f_events.result()
-            incs        = f_incs.result()
-            all_calls   = f_calls.result()
-            front_data  = f_front.result()   # {"convs": [...], "csat": {...}}
-            admin_map   = f_admins.result()
-            admin_id_map= f_admin_ids.result()
-            copro       = f_copro.result()
-            parcels     = f_parcels.result()   # /building_parcels/{bid} → nbLotsMain ?
+            T = 90   # timeout global par tâche (secondes)
+            def _safe(fut, default):
+                try:    return fut.result(timeout=T)
+                except Exception as e:
+                    print(f"  ⚠ future timeout/error: {e}", flush=True)
+                    return default
+
+            manager_name    = _safe(f_mgr,   "")
+            accountant_name = _safe(f_acct,  "")
+            assistant_name  = _safe(f_assist, "")
+            works       = _safe(f_works,  [])
+            projs       = _safe(f_projs,  []) or []
+            events      = _safe(f_events, [])
+            incs        = _safe(f_incs,   [])
+            all_calls   = _safe(f_calls,  [])
+            front_data  = _safe(f_front,  {"convs": [], "csat": {}})
+            admin_map   = _safe(f_admins, {})
+            admin_id_map= _safe(f_admin_ids, {})
+            copro       = _safe(f_copro,  {})
+            parcels     = _safe(f_parcels, {})
             print(f"  🏢 Copropriete {bid} keys: {list(copro.keys())}", flush=True)
             print(f"  📦 Parcels {bid} keys: {list(parcels.keys()) if isinstance(parcels, dict) else type(parcels).__name__}", flush=True)
             print(f"  📅 Events {bid}: {len(events)} entrées", flush=True)
