@@ -2761,6 +2761,85 @@ def debug_building_parcels(bid):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/debug/csat_raw")
+def debug_csat_raw():
+    """Inspecte les 5 premières entrées brutes de /enum/front_csats SANS filtre.
+    → Permet de voir exactement quels champs sont retournés (accountName vide ou pas ?).
+    ?bid=671 pour tester le filtre par building.
+    """
+    try:
+        cfg = load_config()
+        bid = request.args.get("bid", 671, type=int)
+        # Page 1 sans filtre
+        raw_no_filter = hbo(cfg, "/enum/front_csats", params={"itemsPerPage": 5, "page": 1})
+        items_no_filter = list_items(raw_no_filter)
+        # Page 1 avec filtre accountName = nom du bâtiment
+        b = next((b for b in (_buildings_cache.get("data") or []) if b.get("id") == bid), None)
+        b_name = b.get("name") if b else f"bid={bid}"
+        raw_filtered = hbo(cfg, "/enum/front_csats", params={
+            "accountName": b_name,
+            "itemsPerPage": 5, "page": 1,
+        })
+        items_filtered = list_items(raw_filtered)
+        return jsonify({
+            "building": {"id": bid, "name": b_name},
+            "no_filter": {
+                "total": raw_no_filter.get("hydra:totalItems") if isinstance(raw_no_filter, dict) else len(items_no_filter),
+                "sample": items_no_filter[:5],
+                "keys":   list(items_no_filter[0].keys()) if items_no_filter else [],
+            },
+            "filtered_by_accountName": {
+                "total":  raw_filtered.get("hydra:totalItems") if isinstance(raw_filtered, dict) else len(items_filtered),
+                "sample": items_filtered[:5],
+            },
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/debug/ringover_raw")
+def debug_ringover_raw():
+    """Inspecte les tags Ringover et les premiers appels bruts.
+    ?bid=671&date_start=2026-04-02&date_end=2026-04-08
+    """
+    try:
+        cfg        = load_config()
+        bid        = request.args.get("bid", 671, type=int)
+        date_start = request.args.get("date_start", "2026-04-07")
+        date_end   = request.args.get("date_end",   "2026-04-08")
+        b = next((b for b in (_buildings_cache.get("data") or []) if b.get("id") == bid), None)
+        b_name = b.get("name") if b else ""
+
+        # Tags disponibles
+        tags = ringover_get_tags(cfg)
+        tag  = ringover_find_tag_for_building(cfg, b_name, bid=bid)
+
+        # 3 premiers appels bruts de la période (sans filtre tag)
+        base    = cfg["ringover"]["base_url"]
+        api_key = cfg["ringover"]["api_key"]
+        r = requests.get(f"{base}/calls", headers={"Authorization": api_key}, params={
+            "start_date": f"{date_start}T00:00:00.000Z",
+            "end_date":   f"{date_end}T23:59:59.999Z",
+            "limit_count": 3, "limit_offset": 0,
+        }, timeout=20)
+        raw_calls = r.json()
+        call_list = raw_calls.get("call_list", raw_calls.get("callList", raw_calls.get("calls", [])))
+
+        return jsonify({
+            "building": {"id": bid, "name": b_name},
+            "ringover_tags_count": len(tags),
+            "tags_sample": tags[:10],
+            "tag_matched": tag,
+            "calls_raw_sample": call_list[:3],
+            "call_fields": list(call_list[0].keys()) if call_list else [],
+            "call_tags_field": call_list[0].get("tags") if call_list else "n/a",
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "version": "csat-tag-union-v6"})
