@@ -155,7 +155,8 @@ def ringover_get_tags(cfg):
         r = requests.get(f"{base}/tags", headers={"Authorization": api_key}, timeout=15)
         r.raise_for_status()
         data = r.json()
-        tags = data.get("tag_list", data.get("tags", data if isinstance(data, list) else []))
+        # Ringover /tags retourne {"list_count": N, "list": [...]}
+        tags = data.get("list", data.get("tag_list", data.get("tags", data if isinstance(data, list) else [])))
         _ringover_tags_cache["data"]    = tags
         _ringover_tags_cache["expires"] = now + timedelta(hours=4)
         print(f"  📋 Ringover tags: {len(tags)} tags chargés", flush=True)
@@ -168,37 +169,39 @@ def ringover_find_tag_for_building(cfg, building_name, bid=None):
     """Trouve le tag Ringover correspondant à un bâtiment.
 
     Structure des tags Ringover : '{copropriete_id} - {copropriete_name}'
+    Champ tag : 'name' (pas 'tag_name') — confirmé via API le 2026-04-15.
     → on match en priorité par bid (plus fiable que le nom).
     """
     tags = ringover_get_tags(cfg)
     name_up = building_name.upper().strip() if building_name else ""
 
+    def tag_name(t):
+        return (t.get("name") or t.get("tag_name") or "").strip()
+
     # Essai 1 : correspondance par bid au début du tag name (format "671 - NOM COPRO")
     if bid is not None:
         bid_str = str(bid)
         for t in tags:
-            tname = (t.get("tag_name") or t.get("name") or "").strip()
-            if tname == bid_str or tname.startswith(bid_str + " -") or tname.startswith(bid_str + "-"):
-                print(f"  🏷 Ringover: tag trouvé par bid={bid}: '{tname}'", flush=True)
+            tn = tag_name(t)
+            if tn == bid_str or tn.startswith(bid_str + " -") or tn.startswith(bid_str + "-"):
+                print(f"  🏷 Ringover: tag trouvé par bid={bid}: '{tn}'", flush=True)
                 return t
 
     # Essai 2 : correspondance exacte sur le nom
     for t in tags:
-        if (t.get("tag_name") or t.get("name") or "").upper().strip() == name_up:
+        if tag_name(t).upper() == name_up:
             return t
 
     # Essai 3 : mots clés significatifs (adresse)
     words = [w for w in name_up.split() if len(w) > 3 and not w.isdigit()]
     if words:
         for t in tags:
-            tname = (t.get("tag_name") or t.get("name") or "").upper()
-            if all(w in tname for w in words[:3]):
+            if all(w in tag_name(t).upper() for w in words[:3]):
                 return t
 
     # Essai 4 : premier mot significatif
     for t in tags:
-        tname = (t.get("tag_name") or t.get("name") or "").upper()
-        if words and words[0] in tname:
+        if words and words[0] in tag_name(t).upper():
             return t
 
     return None
@@ -257,14 +260,24 @@ def ringover_calls(cfg, date_start, date_end, building_name="", bid=None, buildi
                 if not batch:
                     break
                 # Filtrer par tag_id si connu
+                # Champ "tags" dans un appel : None ou liste de dicts {tag_id, name, ...}
                 if tag_id is not None:
-                    batch = [
-                        c for c in batch
-                        if any(
+                    filtered = []
+                    for c in batch:
+                        call_tags = c.get("tags")
+                        if not call_tags:
+                            continue  # pas de tag → exclure
+                        matched = any(
                             str(t.get("tag_id") or t.get("id") or "") == str(tag_id)
-                            for t in (c.get("tags") or [])
+                            for t in call_tags
                         )
-                    ]
+                        if matched:
+                            filtered.append(c)
+                    # Debug : loguer un exemple de tags si batch non vide et filtré = 0
+                    if batch and not filtered and offset == 0:
+                        sample_tags = [c.get("tags") for c in batch[:3]]
+                        print(f"  ℹ Ringover batch[0..2] tags: {sample_tags}", flush=True)
+                    batch = filtered
                 all_calls.extend(batch)
                 raw_batch_size = len(data.get("call_list", data.get("callList", data.get("calls", []))))
                 if raw_batch_size < 100:
