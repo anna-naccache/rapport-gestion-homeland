@@ -949,12 +949,11 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
             return {"convs": [], "csat": {}}
         convs = front_convs_for_tag(cfg, tag["id"], date_start, date_end)
 
-        # CSAT via HBO /enum/front_csats (account_name = b_name)
-        csat = fetch_hbo_csat(cfg, b_name, date_start, date_end)
-        if not csat or not csat.get("count"):
-            # Fallback : chercher dans les tags Front des conversations
-            print(f"  ↩ CSAT HBO vide → fallback tags Front pour '{b_name}'", flush=True)
-            csat = front_csat_from_convs(convs)
+        # CSAT via tags Front des conversations du bâtiment.
+        # Note : l'API HBO /enum/front_csats ne retourne pas accountName dans ses réponses
+        # (bug HBO confirmé le 2026-04-15) → impossible de filtrer par copropriété.
+        # On utilise les conversations Front tagguées qui sont déjà filtrées par bâtiment.
+        csat = front_csat_from_convs(convs)
 
         print(f"  ✅ Front '{tag['name']}': {len(convs)} convs, CSAT={csat.get('score')} ({csat.get('count',0)} notes)")
         return {"convs": convs, "csat": csat}
