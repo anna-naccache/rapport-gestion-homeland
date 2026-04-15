@@ -851,13 +851,13 @@ def front_csat_from_convs(convs):
 def fetch_hbo_csat(cfg, account_name, date_start, date_end):
     """Récupère le CSAT depuis l'API HBO GET /enum/front_csats.
 
-    Champs de la réponse HBO (snake_case selon l'user) :
-      account_name, survey_rating, message_date
-    Aussi testé en camelCase : accountName, surveyRating, messageDate
+    Schéma de réponse (source : https://hbo.homeland.immo/api/doc) :
+      id, contactName, contactHandle, accountName, surveyRating,
+      surveyComment, attributedTo, messageDate, inbox
+    Tous les champs sont en camelCase.
 
-    Filtre côté API par account_name / accountName, puis filtre local
-    sur la date et sur le nom de copropriété.
-    Retourne le même format que front_csat_from_convs().
+    Filtre API : accountName, messageDate[after], messageDate[before].
+    Filtre local en backup sur accountName et messageDate.
     """
     if not cfg.get("hbo"):
         return {}
@@ -868,31 +868,26 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
 
         scores = []
         page   = 1
-        total_items_seen = 0
+        total_seen = 0
         while True:
-            # Tenter les deux variantes de noms de paramètres
             data = hbo(cfg, "/enum/front_csats", params={
-                "account_name":            account_name,   # snake_case
-                "accountName":             account_name,   # camelCase
-                "message_date[after]":     date_start,
-                "message_date[before]":    date_end,
-                "messageDate[after]":      date_start,
-                "messageDate[before]":     date_end,
-                "itemsPerPage": 200,
-                "page": page,
+                "accountName":          account_name,
+                "messageDate[after]":   date_start,
+                "messageDate[before]":  date_end,
+                "itemsPerPage":         200,
+                "page":                 page,
             })
             items = list_items(data)
             if not items:
                 break
-            total_items_seen += len(items)
+            total_seen += len(items)
             for item in items:
-                # Lire account_name (snake_case en priorité, puis camelCase)
-                an = (item.get("account_name") or item.get("accountName") or "").upper().strip()
-                # Filtrer par copropriété (si le champ est présent)
+                # Filtre local : accountName (au cas où l'API ne filtre pas)
+                an = (item.get("accountName") or "").upper().strip()
                 if an and an != name_up:
                     continue
-                # Lire la date (snake_case en priorité, puis camelCase)
-                md = item.get("message_date") or item.get("messageDate") or ""
+                # Filtre local : messageDate
+                md = item.get("messageDate") or ""
                 if md:
                     try:
                         item_dt = datetime.fromisoformat(md[:10])
@@ -900,9 +895,8 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
                             continue
                     except ValueError:
                         pass
-                # Lire la note (snake_case en priorité, puis camelCase)
-                raw = item.get("survey_rating") if item.get("survey_rating") is not None \
-                      else item.get("surveyRating")
+                # Note CSAT
+                raw = item.get("surveyRating")
                 if raw is not None:
                     try:
                         scores.append(min(max(float(raw), 1), 5))
@@ -920,7 +914,7 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
                 "score":        avg,
                 "distribution": {i: dist.get(i, 0) for i in range(1, 6)},
             })
-        print(f"  ✅ HBO CSAT '{account_name}': {total_items_seen} vus, {len(scores)} retenus, score={result.get('score')}", flush=True)
+        print(f"  ✅ HBO CSAT '{account_name}': {total_seen} vus, {len(scores)} retenus, score={result.get('score')}", flush=True)
         return result
     except Exception as e:
         print(f"  ⚠ fetch_hbo_csat('{account_name}'): {e}", flush=True)
