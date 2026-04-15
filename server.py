@@ -720,8 +720,7 @@ def _get_all_front_tags(cfg):
             if not nxt or "page_token=" not in nxt:
                 break
             page_token = nxt.split("page_token=")[-1].split("&")[0]
-            # Pause inter-page : 1.5s ≈ 40 req/min, sous la limite Front (~50 req/min)
-            _time.sleep(1.5)
+            # Pas de pause fixe : la boucle de retry 429 gère le rate-limit dynamiquement
 
         _front_tags_cache["data"]    = all_tags
         _front_tags_cache["expires"] = now + timedelta(hours=4)
@@ -869,6 +868,8 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
         scores = []
         page   = 1
         total_seen = 0
+        MAX_PAGES_NO_MATCH = 5   # si le filtre API fonctionne, on ne lit que peu de pages
+        pages_without_match = 0
         while True:
             data = hbo(cfg, "/enum/front_csats", params={
                 "accountName":          account_name,
@@ -881,6 +882,7 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
             if not items:
                 break
             total_seen += len(items)
+            page_matched = 0
             for item in items:
                 # Filtre local : accountName (au cas où l'API ne filtre pas)
                 an = (item.get("accountName") or "").upper().strip()
@@ -900,8 +902,18 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
                 if raw is not None:
                     try:
                         scores.append(min(max(float(raw), 1), 5))
+                        page_matched += 1
                     except (TypeError, ValueError):
                         pass
+            if page_matched == 0:
+                pages_without_match += 1
+                # Si plusieurs pages consécutives sans résultat → le filtre API fonctionne
+                # et il n'y a simplement pas de CSAT pour ce compte/cette période
+                if pages_without_match >= MAX_PAGES_NO_MATCH:
+                    print(f"  ℹ CSAT: {MAX_PAGES_NO_MATCH} pages sans résultat → arrêt anticipé", flush=True)
+                    break
+            else:
+                pages_without_match = 0  # reset si on trouve à nouveau des résultats
             if len(items) < 200:
                 break
             page += 1
@@ -1005,7 +1017,7 @@ def _get_all_front_accounts(cfg):
             if not nxt or "page_token=" not in nxt:
                 break
             page_token = nxt.split("page_token=")[-1].split("&")[0]
-            _time.sleep(1.5)   # pause inter-page ≈ 40 req/min
+            # Pas de pause fixe : la boucle de retry 429 gère le rate-limit dynamiquement
 
         _front_accounts_cache["data"]    = all_accounts
         _front_accounts_cache["expires"] = now + timedelta(hours=4)
