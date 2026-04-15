@@ -1811,7 +1811,16 @@ def get_building_data(bid):
 
         def _fetch_parcels(bid_):
             """Compte les lots depuis /building_parcels/{bid}.
-            Retourne dict avec lots_total, lots_habitation (apparts+studios), lots_detail.
+
+            Champs retournés par l'API (confirmés) :
+              id, building_id, main_parcel, type, number, description,
+              parcel_class, date_entree, updated_at, created_at, status
+
+            Stratégie :
+              - lots_principaux = items où main_parcel est truthy
+                (= "lots principaux" au sens juridique, champ explicite HBO)
+              - lots_total = nb total d'items retournés
+              - lots_detail = répartition par type
             """
             data = hbo(cfg, f"/building_parcels/{bid_}")
             if data is None:
@@ -1819,17 +1828,12 @@ def get_building_data(bid):
             items = data if isinstance(data, list) else list_items(data)
             if not items:
                 return {}
-            # Compter par type
-            HABITATION = {"appartement", "studio", "duplex", "triplex", "loft", "chambre"}
             from collections import Counter as _Counter
-            type_counts = _Counter((p.get("type") or "").strip() for p in items)
-            lots_habitation = sum(
-                v for t, v in type_counts.items()
-                if any(h in t.lower() for h in HABITATION)
-            )
+            type_counts     = _Counter((p.get("type") or "").strip() for p in items)
+            lots_principaux = sum(1 for p in items if p.get("main_parcel"))
             return {
                 "lots_total":      len(items),
-                "lots_habitation": lots_habitation,
+                "lots_principaux": lots_principaux,
                 "lots_detail":     dict(type_counts),
             }
 
@@ -1914,11 +1918,11 @@ def get_building_data(bid):
                       b.get("managedSince") or b.get("dateCreation") or "")
         if created_at: created_at = created_at[:10]
 
-        # Lots : /building_parcels/{bid} → compter les lots d'habitation (apparts + studios)
-        # Fallback si building_parcels échoue : /copropriete ou /building
+        # Lots : /building_parcels/{bid} → lots principaux (champ main_parcel=True)
+        # Fallback si building_parcels échoue : champs HBO /copropriete ou /building
         lots_count = (
-            parcels.get("lots_habitation")              # nouveau calcul depuis parcels list
-            or parcels.get("lots_total")               # fallback total
+            parcels.get("lots_principaux")              # main_parcel=True (source primaire)
+            or parcels.get("lots_total")               # fallback : total items
             or copro.get("copropriété_lotsppx") or copro.get("copropriete_lotsppx")
             or copro.get("lotsppx") or copro.get("lots_ppx") or copro.get("lots")
             or copro.get("nbLotsMain") or copro.get("nbLotsTotal")
