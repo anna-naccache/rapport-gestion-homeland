@@ -164,29 +164,46 @@ def ringover_get_tags(cfg):
         print(f"  ⚠ Ringover GET /tags: {e}", flush=True)
         return []
 
-def ringover_find_tag_for_building(cfg, building_name):
-    """Trouve le tag Ringover correspondant à un bâtiment (correspondance partielle du nom)."""
+def ringover_find_tag_for_building(cfg, building_name, bid=None):
+    """Trouve le tag Ringover correspondant à un bâtiment.
+
+    Structure des tags Ringover : '{copropriete_id} - {copropriete_name}'
+    → on match en priorité par bid (plus fiable que le nom).
+    """
     tags = ringover_get_tags(cfg)
-    name_up = building_name.upper().strip()
-    # Essai 1 : correspondance exacte
+    name_up = building_name.upper().strip() if building_name else ""
+
+    # Essai 1 : correspondance par bid au début du tag name (format "671 - NOM COPRO")
+    if bid is not None:
+        bid_str = str(bid)
+        for t in tags:
+            tname = (t.get("tag_name") or t.get("name") or "").strip()
+            if tname == bid_str or tname.startswith(bid_str + " -") or tname.startswith(bid_str + "-"):
+                print(f"  🏷 Ringover: tag trouvé par bid={bid}: '{tname}'", flush=True)
+                return t
+
+    # Essai 2 : correspondance exacte sur le nom
     for t in tags:
         if (t.get("tag_name") or t.get("name") or "").upper().strip() == name_up:
             return t
-    # Essai 2 : mots clés significatifs (adresse)
+
+    # Essai 3 : mots clés significatifs (adresse)
     words = [w for w in name_up.split() if len(w) > 3 and not w.isdigit()]
     if words:
         for t in tags:
             tname = (t.get("tag_name") or t.get("name") or "").upper()
             if all(w in tname for w in words[:3]):
                 return t
-    # Essai 3 : premier mot de longueur > 4 dans le nom
+
+    # Essai 4 : premier mot significatif
     for t in tags:
         tname = (t.get("tag_name") or t.get("name") or "").upper()
         if words and words[0] in tname:
             return t
+
     return None
 
-def ringover_calls(cfg, date_start, date_end, building_name="", building_tags=None, max_calls=5000):
+def ringover_calls(cfg, date_start, date_end, building_name="", bid=None, building_tags=None, max_calls=5000):
     """Récupère les appels Ringover sur la période, filtrés par tag de bâtiment.
 
     L'API impose max 15 jours entre start_date et end_date → découpe en tranches.
@@ -198,15 +215,15 @@ def ringover_calls(cfg, date_start, date_end, building_name="", building_tags=No
     base, api_key = cfg["ringover"]["base_url"], cfg["ringover"]["api_key"]
     headers = {"Authorization": api_key}
 
-    # Trouver le tag du bâtiment
+    # Trouver le tag du bâtiment (bid en priorité, puis nom)
     tag_id = None
-    if building_name and cfg.get("ringover"):
-        tag = ringover_find_tag_for_building(cfg, building_name)
+    if cfg.get("ringover") and (bid is not None or building_name):
+        tag = ringover_find_tag_for_building(cfg, building_name, bid=bid)
         if tag:
             tag_id = tag.get("tag_id") or tag.get("id")
             print(f"  🏷 Ringover tag trouvé: '{tag.get('tag_name') or tag.get('name')}' (id={tag_id})", flush=True)
         else:
-            print(f"  ⚠ Ringover: aucun tag pour '{building_name}'", flush=True)
+            print(f"  ⚠ Ringover: aucun tag pour bid={bid} / '{building_name}'", flush=True)
 
     # Découper la période en tranches ≤ 15 jours
     from datetime import date as _date
@@ -834,12 +851,12 @@ def front_csat_from_convs(convs):
 def fetch_hbo_csat(cfg, account_name, date_start, date_end):
     """Récupère le CSAT depuis l'API HBO GET /enum/front_csats.
 
-    Schéma HBO (camelCase) :
-      accountName, surveyRating, surveyComment, messageDate,
-      contactName, contactHandle, attributedTo, inbox
+    Champs de la réponse HBO (snake_case selon l'user) :
+      account_name, survey_rating, message_date
+    Aussi testé en camelCase : accountName, surveyRating, messageDate
 
-    Filtre : tente accountName + messageDate[after/before] côté API.
-    Si les filtres ne sont pas supportés → filtre en local.
+    Filtre côté API par account_name / accountName, puis filtre local
+    sur la date et sur le nom de copropriété.
     Retourne le même format que front_csat_from_convs().
     """
     if not cfg.get("hbo"):
@@ -851,9 +868,14 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
 
         scores = []
         page   = 1
+        total_items_seen = 0
         while True:
+            # Tenter les deux variantes de noms de paramètres
             data = hbo(cfg, "/enum/front_csats", params={
-                "accountName":             account_name,
+                "account_name":            account_name,   # snake_case
+                "accountName":             account_name,   # camelCase
+                "message_date[after]":     date_start,
+                "message_date[before]":    date_end,
                 "messageDate[after]":      date_start,
                 "messageDate[before]":     date_end,
                 "itemsPerPage": 200,
@@ -862,12 +884,15 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
             items = list_items(data)
             if not items:
                 break
+            total_items_seen += len(items)
             for item in items:
-                # Filtre local en cas d'absence de filtre API
-                an = (item.get("accountName") or "").upper().strip()
+                # Lire account_name (snake_case en priorité, puis camelCase)
+                an = (item.get("account_name") or item.get("accountName") or "").upper().strip()
+                # Filtrer par copropriété (si le champ est présent)
                 if an and an != name_up:
                     continue
-                md = item.get("messageDate") or ""
+                # Lire la date (snake_case en priorité, puis camelCase)
+                md = item.get("message_date") or item.get("messageDate") or ""
                 if md:
                     try:
                         item_dt = datetime.fromisoformat(md[:10])
@@ -875,7 +900,9 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
                             continue
                     except ValueError:
                         pass
-                raw = item.get("surveyRating")
+                # Lire la note (snake_case en priorité, puis camelCase)
+                raw = item.get("survey_rating") if item.get("survey_rating") is not None \
+                      else item.get("surveyRating")
                 if raw is not None:
                     try:
                         scores.append(min(max(float(raw), 1), 5))
@@ -893,7 +920,7 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
                 "score":        avg,
                 "distribution": {i: dist.get(i, 0) for i in range(1, 6)},
             })
-        print(f"  ✅ HBO CSAT '{account_name}': {len(scores)} notes, score={result.get('score')}", flush=True)
+        print(f"  ✅ HBO CSAT '{account_name}': {total_items_seen} vus, {len(scores)} retenus, score={result.get('score')}", flush=True)
         return result
     except Exception as e:
         print(f"  ⚠ fetch_hbo_csat('{account_name}'): {e}", flush=True)
@@ -902,7 +929,10 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
 
 def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
     """Récupère conversations + CSAT Front pour un bâtiment (via son tag).
-    CSAT vient maintenant de l'API HBO /front_csat (plus fiable que les tags).
+
+    - Conversations : via le tag Front du bâtiment (bid / nom)
+    - CSAT : via l'API HBO GET /enum/front_csats (account_name = b_name)
+             → fallback sur les tags Front si HBO ne retourne rien
     """
     if not cfg.get("front"):
         return {"convs": [], "csat": {}}
@@ -912,9 +942,15 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
             print(f"  ⚠ Front: aucun tag trouvé pour building {bid}")
             return {"convs": [], "csat": {}}
         convs = front_convs_for_tag(cfg, tag["id"], date_start, date_end)
-        # CSAT via HBO directement (account_name = b_name)
-        csat  = front_csat_from_convs(convs)  # CSAT via tags Front (accountName absent de l'API HBO)
-        print(f"  ✅ Front '{tag['name']}': {len(convs)} convs, CSAT={csat.get('score')}")
+
+        # CSAT via HBO /enum/front_csats (account_name = b_name)
+        csat = fetch_hbo_csat(cfg, b_name, date_start, date_end)
+        if not csat or not csat.get("count"):
+            # Fallback : chercher dans les tags Front des conversations
+            print(f"  ↩ CSAT HBO vide → fallback tags Front pour '{b_name}'", flush=True)
+            csat = front_csat_from_convs(convs)
+
+        print(f"  ✅ Front '{tag['name']}': {len(convs)} convs, CSAT={csat.get('score')} ({csat.get('count',0)} notes)")
         return {"convs": convs, "csat": csat}
     except Exception as e:
         print(f"  ⚠ fetch_front_for_building({bid}): {e}")
@@ -1792,7 +1828,7 @@ def get_building_data(bid):
             f_projs     = ex.submit(fetch_projects_hbo, cfg, bid)
             f_events    = ex.submit(_fetch_building_events, bid)
             f_incs      = ex.submit(lambda: list_items(hbo(cfg, "/incidents",  {"building_id": bid})))
-            f_calls     = ex.submit(ringover_calls, cfg, date_start, date_end, b_name)
+            f_calls     = ex.submit(ringover_calls, cfg, date_start, date_end, b_name, bid)
             f_front     = ex.submit(fetch_front_for_building, cfg, bid, b_name, date_start, date_end)
             f_admins    = ex.submit(get_admin_users_map, cfg)
             f_admin_ids = ex.submit(get_admin_users_id_map, cfg)
