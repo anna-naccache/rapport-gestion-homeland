@@ -881,53 +881,47 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
         scores = []
         page   = 1
         total_seen = 0
-        MAX_PAGES_NO_MATCH = 5   # si le filtre API fonctionne, on ne lit que peu de pages
-        pages_without_match = 0
-        while True:
+        stop_early = False
+        # Pas de filtre API sur accountName ni messageDate (non supportés).
+        # On filtre entièrement en local :
+        #   - accountName doit correspondre exactement (champ absent = null = exclu)
+        #   - messageDate dans la fenêtre demandée
+        # Les CSAT sont triés du plus récent au plus ancien → arrêt dès qu'on dépasse date_start.
+        while not stop_early:
             data = hbo(cfg, "/enum/front_csats", params={
-                "accountName":          account_name,
-                "messageDate[after]":   date_start,
-                "messageDate[before]":  date_end,
-                "itemsPerPage":         200,
-                "page":                 page,
+                "itemsPerPage": 1000,   # max par page pour minimiser le nb de requêtes
+                "page":         page,
+                "partial":      "true",
             })
             items = list_items(data)
             if not items:
                 break
             total_seen += len(items)
-            page_matched = 0
             for item in items:
-                # Filtre local : accountName (au cas où l'API ne filtre pas)
+                # Filtre accountName : doit correspondre exactement.
+                # Si le champ est absent (null), il n'est pas retourné → an = "" → on exclut.
                 an = (item.get("accountName") or "").upper().strip()
-                if an and an != name_up:
+                if an != name_up:
                     continue
-                # Filtre local : messageDate
+                # Filtre messageDate : arrêt anticipé si on dépasse la fenêtre (tri DESC)
                 md = item.get("messageDate") or ""
                 if md:
                     try:
                         item_dt = datetime.fromisoformat(md[:10])
-                        if not (start_dt <= item_dt <= end_dt):
-                            continue
+                        if item_dt < start_dt:
+                            stop_early = True   # tous les suivants sont encore plus vieux
+                            break
+                        if item_dt > end_dt:
+                            continue            # trop récent, pas encore dans la fenêtre
                     except ValueError:
                         pass
-                # Note CSAT
                 raw = item.get("surveyRating")
                 if raw is not None:
                     try:
                         scores.append(min(max(float(raw), 1), 5))
-                        page_matched += 1
                     except (TypeError, ValueError):
                         pass
-            if page_matched == 0:
-                pages_without_match += 1
-                # Si plusieurs pages consécutives sans résultat → le filtre API fonctionne
-                # et il n'y a simplement pas de CSAT pour ce compte/cette période
-                if pages_without_match >= MAX_PAGES_NO_MATCH:
-                    print(f"  ℹ CSAT: {MAX_PAGES_NO_MATCH} pages sans résultat → arrêt anticipé", flush=True)
-                    break
-            else:
-                pages_without_match = 0  # reset si on trouve à nouveau des résultats
-            if len(items) < 200:
+            if len(items) < 1000:
                 break
             page += 1
 
@@ -962,11 +956,13 @@ def fetch_front_for_building(cfg, bid, b_name, date_start, date_end):
             return {"convs": [], "csat": {}}
         convs = front_convs_for_tag(cfg, tag["id"], date_start, date_end)
 
-        # CSAT via tags Front des conversations du bâtiment.
-        # Note : l'API HBO /enum/front_csats ne retourne pas accountName dans ses réponses
-        # (bug HBO confirmé le 2026-04-15) → impossible de filtrer par copropriété.
-        # On utilise les conversations Front tagguées qui sont déjà filtrées par bâtiment.
-        csat = front_csat_from_convs(convs)
+        # CSAT via HBO /enum/front_csats filtré localement sur accountName.
+        # accountName n'est retourné que quand non-null → items sans accountName sont exclus.
+        # Fallback sur les tags Front si HBO ne retourne rien.
+        csat = fetch_hbo_csat(cfg, b_name, date_start, date_end)
+        if not csat or not csat.get("count"):
+            print(f"  ↩ CSAT HBO vide → fallback tags Front pour '{b_name}'", flush=True)
+            csat = front_csat_from_convs(convs)
 
         print(f"  ✅ Front '{tag['name']}': {len(convs)} convs, CSAT={csat.get('score')} ({csat.get('count',0)} notes)")
         return {"convs": convs, "csat": csat}
