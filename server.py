@@ -901,23 +901,25 @@ def fetch_hbo_csat(cfg, account_name, date_start, date_end):
                 break
             total_seen += len(items)
             for item in items:
-                # Filtre accountName : doit correspondre exactement.
-                # Si le champ est absent (null), il n'est pas retourné → an = "" → on exclut.
-                an = (item.get("accountName") or "").upper().strip()
-                if an != name_up:
-                    continue
-                # Filtre messageDate : arrêt anticipé si on dépasse la fenêtre (tri DESC)
+                # Arrêt anticipé sur la DATE (indépendamment de accountName).
+                # CSATs triés du plus récent au plus ancien → dès qu'un item est
+                # plus ancien que start_dt, tous les suivants le seront aussi.
                 md = item.get("messageDate") or ""
                 if md:
                     try:
                         item_dt = datetime.fromisoformat(md[:10])
                         if item_dt < start_dt:
-                            stop_early = True   # tous les suivants sont encore plus vieux
+                            stop_early = True
                             break
                         if item_dt > end_dt:
-                            continue            # trop récent, pas encore dans la fenêtre
+                            continue   # trop récent, hors fenêtre
                     except ValueError:
                         pass
+                # Filtre accountName : doit correspondre exactement.
+                # Champ absent (null) → non retourné par l'API → an = "" → exclu.
+                an = (item.get("accountName") or "").upper().strip()
+                if an != name_up:
+                    continue
                 raw = item.get("surveyRating")
                 if raw is not None:
                     try:
