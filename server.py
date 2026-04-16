@@ -247,39 +247,34 @@ def ringover_calls(cfg, date_start, date_end, building_name="", bid=None, buildi
         offset = 0
         while len(all_calls) < max_calls:
             try:
-                r = requests.get(f"{base}/calls",
-                    headers=headers,
-                    params={
-                        "start_date":   f"{chunk_start}T00:00:00.000Z",
-                        "end_date":     f"{chunk_end}T23:59:59.999Z",
-                        "limit_count":  100,
-                        "limit_offset": offset,
-                    },
-                    timeout=20)
+                params = {
+                    "start_date":   f"{chunk_start}T00:00:00.000Z",
+                    "end_date":     f"{chunk_end}T23:59:59.999Z",
+                    "limit_count":  100,
+                    "limit_offset": offset,
+                }
+                # Passer tag_id directement à l'API pour filtrage côté serveur
+                if tag_id is not None:
+                    params["tag_id"] = tag_id
+                r = requests.get(f"{base}/calls", headers=headers, params=params, timeout=20)
+                if r.status_code == 400:
+                    # Offset trop élevé ou autre erreur → fin de ce chunk
+                    print(f"  ⚠ Ringover [{chunk_start}→{chunk_end}] offset={offset}: 400, fin chunk", flush=True)
+                    break
                 r.raise_for_status()
                 data  = r.json()
                 batch = data.get("call_list", data.get("callList", data.get("calls", [])))
                 if not batch:
                     break
-                # Filtrer par tag_id si connu
-                # Champ "tags" dans un appel : None ou liste de dicts {tag_id, name, ...}
+                # Filtre local par tag_id en backup (si l'API ignore le paramètre)
                 if tag_id is not None:
-                    filtered = []
-                    for c in batch:
-                        call_tags = c.get("tags")
-                        if not call_tags:
-                            continue  # pas de tag → exclure
-                        matched = any(
-                            str(t.get("tag_id") or t.get("id") or "") == str(tag_id)
-                            for t in call_tags
+                    batch = [
+                        c for c in batch
+                        if c.get("tags") and any(
+                            str(t.get("tag_id") or "") == str(tag_id)
+                            for t in c["tags"]
                         )
-                        if matched:
-                            filtered.append(c)
-                    # Debug : loguer un exemple de tags si batch non vide et filtré = 0
-                    if batch and not filtered and offset == 0:
-                        sample_tags = [c.get("tags") for c in batch[:3]]
-                        print(f"  ℹ Ringover batch[0..2] tags: {sample_tags}", flush=True)
-                    batch = filtered
+                    ]
                 all_calls.extend(batch)
                 raw_batch_size = len(data.get("call_list", data.get("callList", data.get("calls", []))))
                 if raw_batch_size < 100:
@@ -1738,6 +1733,61 @@ def get_buildings_raw():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHE RAPPORT  (fichier JSON, TTL configurable)
+# ─────────────────────────────────────────────────────────────────────────────
+REPORT_CACHE_FILE = BASE_DIR / "data_cache.json"
+REPORT_CACHE_TTL_DAYS = 7   # renouvellement hebdomadaire par défaut
+
+def _load_report_cache():
+    try:
+        if REPORT_CACHE_FILE.exists():
+            return json.loads(REPORT_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_report_cache(cache):
+    try:
+        REPORT_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, default=str),
+                                     encoding="utf-8")
+    except Exception as e:
+        print(f"  ⚠ Écriture cache rapport: {e}", flush=True)
+
+def _cache_key(bid, date_start, date_end):
+    return f"{bid}|{date_start}|{date_end}"
+
+def _cache_get(bid, date_start, date_end):
+    """Retourne (data, age_hours) si entrée valide, sinon (None, None)."""
+    cache = _load_report_cache()
+    key   = _cache_key(bid, date_start, date_end)
+    entry = cache.get(key)
+    if not entry:
+        return None, None
+    try:
+        cached_at = datetime.fromisoformat(entry["cached_at"])
+        age_h = (datetime.now() - cached_at).total_seconds() / 3600
+        if age_h < REPORT_CACHE_TTL_DAYS * 24:
+            return entry["data"], age_h
+    except Exception:
+        pass
+    return None, None
+
+def _cache_set(bid, date_start, date_end, data):
+    cache = _load_report_cache()
+    cache[_cache_key(bid, date_start, date_end)] = {
+        "cached_at": datetime.now().isoformat(),
+        "data":      data,
+    }
+    # Garder seulement les 200 entrées les plus récentes
+    if len(cache) > 200:
+        sorted_keys = sorted(cache, key=lambda k: cache[k].get("cached_at",""), reverse=True)
+        cache = {k: cache[k] for k in sorted_keys[:200]}
+    _save_report_cache(cache)
+    print(f"  💾 Cache rapport mis à jour pour bid={bid} ({date_start}→{date_end})", flush=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.route("/api/building/<int:bid>/data")
 def get_building_data(bid):
     try:
@@ -1761,6 +1811,18 @@ def get_building_data(bid):
         de_param = norm_date(request.args.get("date_end"),   end=True)
         date_end   = de_param or now.strftime("%Y-%m-%d")
         date_start = ds_param or (now - timedelta(days=mois * 30)).strftime("%Y-%m-%d")
+
+        # ── Cache hebdomadaire ────────────────────────────────────────────────
+        force_refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+        if not force_refresh:
+            cached, age_h = _cache_get(bid, date_start, date_end)
+            if cached is not None:
+                print(f"  ✅ Cache hit bid={bid} (âge={age_h:.1f}h)", flush=True)
+                cached["_cached"] = True
+                cached["_cache_age_hours"] = round(age_h, 1)
+                return jsonify(cached)
+        else:
+            print(f"  🔄 Refresh forcé bid={bid}", flush=True)
 
         # HBO — infos bâtiment (synchrone, nécessaire pour b_name)
         b      = hbo(cfg, f"/building/{bid}") or {}
@@ -1972,6 +2034,9 @@ def get_building_data(bid):
                 "end":   date_end,
             }
         }
+        # Sauvegarder en cache pour les prochaines requêtes
+        _cache_set(bid, date_start, date_end, result)
+        result["_cached"] = False
         return jsonify(result)
 
     except Exception as e:
@@ -2863,6 +2928,50 @@ def debug_ringover_raw():
         import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/api/building/<int:bid>/refresh", methods=["POST"])
+def refresh_building_cache(bid):
+    """Vide le cache pour ce bâtiment → prochain GET /data recalculera tout."""
+    try:
+        cache = _load_report_cache()
+        removed = [k for k in list(cache.keys()) if k.startswith(f"{bid}|")]
+        for k in removed:
+            del cache[k]
+        _save_report_cache(cache)
+        return jsonify({"ok": True, "removed": len(removed), "bid": bid})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/cache/status")
+def cache_status():
+    """Liste les entrées du cache rapport avec leur âge."""
+    try:
+        cache = _load_report_cache()
+        now   = datetime.now()
+        entries = []
+        for key, entry in cache.items():
+            bid, ds, de = key.split("|", 2)
+            cached_at = datetime.fromisoformat(entry["cached_at"])
+            age_h = (now - cached_at).total_seconds() / 3600
+            entries.append({
+                "bid": int(bid), "date_start": ds, "date_end": de,
+                "cached_at": entry["cached_at"],
+                "age_hours": round(age_h, 1),
+                "expired": age_h >= REPORT_CACHE_TTL_DAYS * 24,
+            })
+        entries.sort(key=lambda x: x["age_hours"])
+        return jsonify({"ttl_days": REPORT_CACHE_TTL_DAYS, "count": len(entries), "entries": entries})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/cache/clear", methods=["POST"])
+def cache_clear():
+    """Vide tout le cache rapport."""
+    try:
+        _save_report_cache({})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/health")
 def health():
