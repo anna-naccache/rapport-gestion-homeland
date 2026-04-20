@@ -1646,7 +1646,7 @@ def _run_id_scan(cfg):
             except Exception:
                 return None
 
-        with ThreadPoolExecutor(max_workers=40) as ex:
+        with ThreadPoolExecutor(max_workers=5) as ex:   # 5 workers → stable sur Render free tier
             futures = {ex.submit(fetch, bid): bid for bid in range(51, 979)}
             for fut in as_completed(futures):
                 b = fut.result()
@@ -2987,31 +2987,22 @@ def health():
 # ─────────────────────────────────────────────
 
 def _warmup():
+    """Warmup léger au démarrage : uniquement les tags Front.
+
+    Le scan de 928 bâtiments HBO a été retiré du warmup car il consomme
+    trop de mémoire/CPU sur Render free tier et provoque des crashes (502).
+    Le scan se déclenche à la demande via /api/buildings (lazy loading).
+    """
     try:
         cfg = load_config()
-        if not cfg.get("hbo"):
-            return
-        # Cache disque déjà valide → pas besoin de rescan
-        if _buildings_cache["data"] and datetime.now() < _buildings_cache["expires"]:
-            print("  ✅ Cache disque valide, pas de rescan au démarrage", flush=True)
-        else:
-            print("  🔥 Warmup: scan bâtiments au démarrage…", flush=True)
-            _run_id_scan(cfg)
-        # Pre-warm Front tags + accounts en séquence (évite les 429 concurrents)
+        # Tags Front seulement (rapide, essentiel pour tous les rapports)
         if cfg.get("front"):
-            print("  🔥 Warmup: chargement tags Front (cache 4h)…", flush=True)
+            print("  🔥 Warmup: chargement tags Front…", flush=True)
             try:
                 tags = _get_all_front_tags(cfg)
                 print(f"  ✅ {len(tags)} tags Front en cache", flush=True)
             except Exception as fe:
                 print(f"  ⚠ Front tags warmup: {fe}", flush=True)
-            # Comptes APRÈS les tags pour ne pas déclencher 429 concurrent
-            print("  🔥 Warmup: chargement comptes Front (cache 4h)…", flush=True)
-            try:
-                accounts = _get_all_front_accounts(cfg)
-                print(f"  ✅ {len(accounts)} comptes Front en cache", flush=True)
-            except Exception as ae:
-                print(f"  ⚠ Front accounts warmup: {ae}", flush=True)
     except Exception as e:
         print(f"  ⚠ Warmup error: {e}", flush=True)
 
